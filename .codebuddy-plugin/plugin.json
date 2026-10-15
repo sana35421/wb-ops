@@ -1,0 +1,20 @@
+{
+  "name": "wb-ops",
+  "version": "0.6.0",
+  "description": "压缩冗长的工具输出，减少上下文 token 消耗；不改宿主 shell、不加常驻工具定义。0.6.0：PreCompact 压缩指令注入 + 上下文守卫 v2（学习各模型压缩点 / 双档提醒 / 压缩后检查）。",
+  "author": {
+    "name": "wb-ops contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "token",
+    "context",
+    "hooks",
+    "performance"
+  ],
+  "category": "开发工具",
+  "hooks": "./hooks/hooks.json",
+  "commands": [
+    "./commands/report.md"
+  ]
+}

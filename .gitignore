@@ -1,0 +1,15 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 运行 / 调试产物
+bin/trace.log
+TRACE-ON
+_*.log
+
+# 本机数据与备份（账本在 ~/.workbuddy/wb-ops-data/，此处防误入）
+.workbuddy/
+*.bak-*
+
+# 报告产物（如手动输出到本目录）
+dashboard*.html

@@ -1,0 +1,50 @@
+{
+  "description": "wb-ops: 工具输出压缩（Grep/Glob/WebFetch）+ 记忆守卫（SessionStart 检查用户记忆超限并提醒精简）+ 上下文守卫 v2（UserPromptSubmit：学习各模型真实自动压缩点、双档提醒、压缩后水位检查）+ 压缩指令注入（PreCompact：为压缩摘要注入保留清单）",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; S=\"$R/hooks/ctx-guard.mjs\"; for N in \"$(command -v node)\" \"$HOME/.workbuddy/binaries/node/versions/\"*/node.exe \"/c/Program Files/nodejs/node.exe\"; do [ -n \"$N\" ] && [ -x \"$N\" ] && \"$N\" \"$S\" && break; done; exit 0",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; S=\"$R/hooks/memory-guard.mjs\"; for N in \"$(command -v node)\" \"$HOME/.workbuddy/binaries/node/versions/\"*/node.exe \"/c/Program Files/nodejs/node.exe\"; do [ -n \"$N\" ] && [ -x \"$N\" ] && \"$N\" \"$S\" && break; done; exit 0",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Grep|Glob|WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; [ -f \"$R/bin/TRACE-ON\" ] && export WB_OPS_TRACE=1; E=\"$R/bin/wb-ops-trim.exe\"; if [ -x \"$E\" ]; then \"$E\"; else for PY in \"$(command -v python)\" \"$(command -v python3)\" \"$HOME/.workbuddy/binaries/python/versions/\"*/python.exe /c/Python3*/python.exe; do [ -n \"$PY\" ] && [ -x \"$PY\" ] && \"$PY\" \"$R/hooks/trim.py\" && break; done; fi; exit 0",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; S=\"$R/hooks/precompact.mjs\"; for N in \"$(command -v node)\" \"$HOME/.workbuddy/binaries/node/versions/\"*/node.exe \"/c/Program Files/nodejs/node.exe\"; do [ -n \"$N\" ] && [ -x \"$N\" ] && \"$N\" \"$S\" && break; done; exit 0",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

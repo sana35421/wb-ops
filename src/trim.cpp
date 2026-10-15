@@ -1,0 +1,829 @@
+// wb-ops / PostToolUse 输出裁剪 hook —— 原生实现
+//
+// 与 ../hooks/trim.py 行为逐条对齐，但把每次调用的启动开销
+// 从 ~300 ms（bash + Python）降到 ~5 ms（单个静态 exe）。
+//
+// 安全原则（与 Python 版一致）：
+//   1. 认不出来就原样透传 —— 绝不猜测、绝不破坏结构化输出
+//   2. 输出不长就不动 —— 而不是无脑截断
+//   3. 被丢掉的行里，命中 error/warning 等关键词的会捞回来
+//   4. 任何异常都静默退出（不输出 = 宿主保持原样），绝不让 hook 挂住会话
+//
+// 输入：stdin 收到 JSON，含 hook_event_name / tool_name / tool_input / tool_response
+// 输出：stdout 写 JSON，用 hookSpecificOutput.updatedToolOutput 替换工具结果
+//
+// 编译（MSYS2 MinGW-w64）：
+//   export PATH="/d/tool/msys64/mingw64/bin:$PATH"
+//   g++ -O2 -s -static -static-libgcc -static-libstdc++ -o bin/wb-ops-trim.exe src/trim.cpp
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <chrono>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <direct.h>
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+
+// ---------------------------------------------------------------------------
+// 阈值：与 hooks/trim.py 保持一致，改这里也要同步改那边
+//
+// v0.2.2 起预算一律按「字节」计（UTF-8 字节数）：同样字节量的中英文，
+// 上下文成本量级一致；按码点计会被中文内容绕过上界（1 个汉字 ≈ 3 字节 ≈ 1 token）。
+// ---------------------------------------------------------------------------
+static const int MAX_LINES = 120;      // 行数超过这个才裁（触发条件）
+static const int MAX_BYTES = 8000;     // 默认预算：字节数超过这个才裁（触发条件），也是结果硬上界
+static const int HEAD_LINES = 50;      // 开头区域最多看多少行
+static const int TAIL_LINES = 25;      // 结尾区域最多看多少行
+static const int MAX_KEY_LINES = 40;   // 中间区域最多捞回多少条关键行（超出则均匀抽样）
+static const int MIN_LINE_BYTES = 60;  // 截断展示时单行至少保留的字节数，低于此值整行丢弃
+static const int MAX_LINE_BYTES = 1000;// 单行最多展示的字节数（防 minified 超长行吃掉预算）
+static const int MARKER_RESERVE = 300; // 给省略标记预留的字节数
+
+// ---- v0.3.5：预算可配置（WB_OPS_BUDGET，单位字节）----
+static const int BUDGET_MIN = 2000;    // 允许的最小预算（再窄内容只剩骨架）
+static const int BUDGET_CAP = 131072;  // 允许的最大预算（再大等于放弃裁剪）
+
+// 解析 WB_OPS_BUDGET，得到本次裁剪的字节预算；默认 MAX_BYTES。
+// 纯 ASCII 数字（与 hooks/trim.py 的 resolve_budget 完全一致，parity 有专项用例）：
+// 空值/含非数字 -> 回退默认；有效值收敛到 [BUDGET_MIN, BUDGET_CAP]。
+static int resolve_budget() {
+    const char *env = std::getenv("WB_OPS_BUDGET");
+    if (!env) return MAX_BYTES;
+    std::string s(env);
+    const std::string ws = " \t\r\n\v\f";
+    size_t a = 0, b = s.size();
+    while (a < b && ws.find(s[a]) != std::string::npos) a++;
+    while (b > a && ws.find(s[b - 1]) != std::string::npos) b--;
+    if (a == b) return MAX_BYTES;
+    for (size_t k = a; k < b; k++)
+        if (s[k] < '0' || s[k] > '9') return MAX_BYTES;
+    if (b - a > 9) return BUDGET_CAP;  // 位数过多，必然越上界
+    long v = std::strtol(s.substr(a, b - a).c_str(), NULL, 10);
+    if (v < BUDGET_MIN) return BUDGET_MIN;
+    if (v > BUDGET_CAP) return BUDGET_CAP;
+    return (int)v;
+}
+
+// ---------------------------------------------------------------------------
+// 关键行特征：等价于 trim.py 里的 KEY_PATTERN 正则
+// （全是字面量，用子串匹配即可精确复现）
+// ---------------------------------------------------------------------------
+static const char *KEYWORDS[] = {
+    "error", "Error", "ERROR",
+    "fail", "Fail", "FAIL",
+    "warn", "Warn", "WARN",
+    "fatal", "Fatal",
+    "Traceback", "Exception",
+    "cannot", "Cannot",          // 常见错误句式（cannot find / Cannot open）
+    "denied", "refused", "panic",  // 权限拒绝 / 连接拒绝 / 崩溃
+    "timeout", "timed out",      // 超时
+    "not found", "Not Found", "No such file",  // 未找到
+    "\xe9\x94\x99\xe8\xaf\xaf",  // 错误
+    "\xe5\xa4\xb1\xe8\xb4\xa5",  // 失败
+    "\xe8\xad\xa6\xe5\x91\x8a",  // 警告
+    "\xe5\xbc\x82\xe5\xb8\xb8",  // 异常
+    "\xe6\x9c\xaa\xe8\x83\xbd",  // 未能
+    "\xe6\x97\xa0\xe6\xb3\x95",  // 无法
+};
+static const size_t KEYWORD_COUNT = sizeof(KEYWORDS) / sizeof(KEYWORDS[0]);
+
+// 只处理这几类高频大输出工具
+static const char *TRIM_TOOLS[] = {"Bash", "Grep", "Glob", "Read", "WebFetch"};
+static const size_t TRIM_TOOL_COUNT = sizeof(TRIM_TOOLS) / sizeof(TRIM_TOOLS[0]);
+
+static bool is_key_line(const std::string &line) {
+    for (size_t i = 0; i < KEYWORD_COUNT; i++) {
+        if (line.find(KEYWORDS[i]) != std::string::npos) return true;
+    }
+    return false;
+}
+
+static bool is_trim_tool(const std::string &name) {
+    if (name.empty()) return false;
+    for (size_t i = 0; i < TRIM_TOOL_COUNT; i++) {
+        if (name == TRIM_TOOLS[i]) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// trace：仅在设置了 WB_OPS_TRACE 时写文件，平时零开销
+// ---------------------------------------------------------------------------
+static std::string exe_dir() {
+    char buf[1024];
+    DWORD n = GetModuleFileNameA(NULL, buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return std::string(".");
+    std::string path(buf, n);
+    size_t slash = path.find_last_of("\\/");
+    return (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
+}
+
+static void trace(const std::string &msg) {
+    if (!getenv("WB_OPS_TRACE")) return;
+    try {
+        std::string path = exe_dir() + "\\trace.log";
+        FILE *f = fopen(path.c_str(), "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long size = ftell(f);
+            fclose(f);
+            if (size > 256 * 1024) remove(path.c_str());
+        }
+        f = fopen(path.c_str(), "ab");
+        if (!f) return;
+
+        time_t now = time(NULL);
+        struct tm *lt = localtime(&now);
+        char stamp[16] = "??:??:??";
+        if (lt) strftime(stamp, sizeof(stamp), "%H:%M:%S", lt);
+
+        std::string body = msg.size() > 400 ? msg.substr(0, 400) : msg;
+        std::string line = std::string(stamp) + " | exe | " + body + "\n";
+        fwrite(line.data(), 1, line.size(), f);
+        fclose(f);
+    } catch (...) {
+        // 日志失败绝不能影响主流程
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.3.0 节省记账：每次裁剪成功后 append 一行 JSONL（默认开启，失败静默）
+//
+// 落点：%USERPROFILE%\.workbuddy\wb-ops-data\saves-YYYYMM.jsonl
+//   （WB_OPS_STATS_DIR 覆盖数据目录；WB_OPS_STATS=0 整关）
+// 行格式与 hooks/trim.py 的 stats() 逐字节对齐（时间戳除外）：
+//   {"t":毫秒,"s":会话id前8位,"tool":"Grep","b":原始字节,"a":裁剪后字节}
+// 只记尺寸与时间，不落任何输出内容。
+// ---------------------------------------------------------------------------
+static void ensure_dirs(const std::string &path) {
+    for (size_t i = 1; i <= path.size(); i++) {
+        if (i == path.size() || path[i] == '\\' || path[i] == '/') {
+            std::string sub = path.substr(0, i);
+            if (sub.size() > 3) _mkdir(sub.c_str());  // 已存在/失败一律忽略
+        }
+    }
+}
+
+static void stats(const std::string &tool, const std::string &sid,
+                  long long before, long long after) {
+    const char *off = getenv("WB_OPS_STATS");
+    if (off && strcmp(off, "0") == 0) return;  // 显式关闭
+    try {
+        const char *dir = getenv("WB_OPS_STATS_DIR");
+        std::string base = (dir && *dir) ? dir : "";
+        if (base.empty()) {
+            const char *home = getenv("USERPROFILE");
+            if (!home || !*home) return;
+            base = std::string(home) + "\\.workbuddy\\wb-ops-data";
+        }
+        ensure_dirs(base);
+
+        long long now_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch()).count();
+        char month[8] = "000000";
+        time_t tt = time(NULL);
+        struct tm *lt = localtime(&tt);
+        if (lt) strftime(month, sizeof(month), "%Y%m", lt);
+
+        std::string path = base + "\\saves-" + month + ".jsonl";
+        FILE *f = fopen(path.c_str(), "ab");
+        if (!f) return;
+        std::string sid8 = sid.size() > 8 ? sid.substr(0, 8) : sid;
+        std::string line = "{\"t\":" + std::to_string(now_ms) +
+                           ",\"s\":\"" + sid8 + "\",\"tool\":\"" + tool +
+                           "\",\"b\":" + std::to_string(before) +
+                           ",\"a\":" + std::to_string(after) + "}\n";
+        fwrite(line.data(), 1, line.size(), f);
+        fclose(f);
+    } catch (...) {
+        // 记账失败绝不能影响主流程
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 极简 JSON 解析器（够用即可：对象 / 数组 / 字符串 / 数字 / bool / null）
+// ---------------------------------------------------------------------------
+struct JVal {
+    enum Type { NUL, BOOL, NUM, STR, ARR, OBJ } t;
+    bool b;
+    double num;
+    std::string s;
+    std::vector<JVal> arr;
+    std::vector<std::pair<std::string, JVal> > obj;
+
+    JVal() : t(NUL), b(false), num(0) {}
+
+    const JVal *get(const char *key) const {
+        if (t != OBJ) return NULL;
+        for (size_t i = 0; i < obj.size(); i++) {
+            if (obj[i].first == key) return &obj[i].second;
+        }
+        return NULL;
+    }
+};
+
+static void append_utf8(std::string &o, unsigned cp) {
+    if (cp < 0x80) {
+        o += (char)cp;
+    } else if (cp < 0x800) {
+        o += (char)(0xC0 | (cp >> 6));
+        o += (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        o += (char)(0xE0 | (cp >> 12));
+        o += (char)(0x80 | ((cp >> 6) & 0x3F));
+        o += (char)(0x80 | (cp & 0x3F));
+    } else {
+        o += (char)(0xF0 | (cp >> 18));
+        o += (char)(0x80 | ((cp >> 12) & 0x3F));
+        o += (char)(0x80 | ((cp >> 6) & 0x3F));
+        o += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+struct Parser {
+    const std::string &s;
+    size_t i;
+    int depth;
+    bool ok;
+
+    Parser(const std::string &in) : s(in), i(0), depth(0), ok(true) {}
+
+    void ws() {
+        while (i < s.size()) {
+            char c = s[i];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') i++;
+            else break;
+        }
+    }
+
+    bool hex4(unsigned &v) {
+        if (i + 4 > s.size()) return false;
+        v = 0;
+        for (int k = 0; k < 4; k++) {
+            char c = s[i++];
+            int d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else return false;
+            v = (v << 4) | (unsigned)d;
+        }
+        return true;
+    }
+
+    bool parse_string(std::string &out) {
+        if (i >= s.size() || s[i] != '"') return false;
+        i++;
+        out.clear();
+        while (i < s.size()) {
+            char c = s[i++];
+            if (c == '"') return true;
+            if (c != '\\') {
+                out += c;
+                continue;
+            }
+            if (i >= s.size()) return false;
+            char e = s[i++];
+            switch (e) {
+                case '"':  out += '"';  break;
+                case '\\': out += '\\'; break;
+                case '/':  out += '/';  break;
+                case 'b':  out += '\b'; break;
+                case 'f':  out += '\f'; break;
+                case 'n':  out += '\n'; break;
+                case 'r':  out += '\r'; break;
+                case 't':  out += '\t'; break;
+                case 'u': {
+                    unsigned cp;
+                    if (!hex4(cp)) return false;
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        // 高代理项：尝试合并后面的低代理项
+                        if (i + 5 < s.size() && s[i] == '\\' && s[i + 1] == 'u') {
+                            size_t save = i;
+                            i += 2;
+                            unsigned lo;
+                            if (hex4(lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            } else {
+                                i = save;
+                                cp = 0xFFFD;
+                            }
+                        } else {
+                            cp = 0xFFFD;
+                        }
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        cp = 0xFFFD;  // 孤立低代理项
+                    }
+                    append_utf8(out, cp);
+                    break;
+                }
+                default:
+                    return false;
+            }
+        }
+        return false;
+    }
+
+    bool parse_number(JVal &v) {
+        size_t st = i;
+        if (i < s.size() && s[i] == '-') i++;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++;
+        if (i < s.size() && s[i] == '.') {
+            i++;
+            while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++;
+        }
+        if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+            i++;
+            if (i < s.size() && (s[i] == '+' || s[i] == '-')) i++;
+            while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++;
+        }
+        if (i == st) return false;
+        v.t = JVal::NUM;
+        v.num = strtod(s.substr(st, i - st).c_str(), NULL);
+        return true;
+    }
+
+    // 递归入口：统一在这里维护 depth，保证任何返回路径都平衡
+    bool parse(JVal &v) {
+        if (++depth > 100) return false;  // 防御性深度限制
+        bool r = parse_value(v);
+        depth--;
+        return r;
+    }
+
+    bool parse_value(JVal &v) {
+        ws();
+        if (i >= s.size()) return false;
+
+        char c = s[i];
+        if (c == '{') {
+            v.t = JVal::OBJ;
+            i++;
+            ws();
+            if (i < s.size() && s[i] == '}') {
+                i++;
+                return true;
+            }
+            while (true) {
+                ws();
+                std::string key;
+                if (!parse_string(key)) return false;
+                ws();
+                if (i >= s.size() || s[i] != ':') return false;
+                i++;
+                JVal child;
+                if (!parse(child)) return false;
+                v.obj.push_back(std::make_pair(key, child));
+                ws();
+                if (i < s.size() && s[i] == ',') { i++; continue; }
+                if (i < s.size() && s[i] == '}') { i++; break; }
+                return false;
+            }
+            return true;
+        }
+        if (c == '[') {
+            v.t = JVal::ARR;
+            i++;
+            ws();
+            if (i < s.size() && s[i] == ']') {
+                i++;
+                return true;
+            }
+            while (true) {
+                JVal child;
+                if (!parse(child)) return false;
+                v.arr.push_back(child);
+                ws();
+                if (i < s.size() && s[i] == ',') { i++; continue; }
+                if (i < s.size() && s[i] == ']') { i++; break; }
+                return false;
+            }
+            return true;
+        }
+        if (c == '"') {
+            v.t = JVal::STR;
+            return parse_string(v.s);
+        }
+        if (c == 't' && s.compare(i, 4, "true") == 0) {
+            i += 4; v.t = JVal::BOOL; v.b = true;
+            return true;
+        }
+        if (c == 'f' && s.compare(i, 5, "false") == 0) {
+            i += 5; v.t = JVal::BOOL; v.b = false;
+            return true;
+        }
+        if (c == 'n' && s.compare(i, 4, "null") == 0) {
+            i += 4; v.t = JVal::NUL;
+            return true;
+        }
+        if (c == '-' || (c >= '0' && c <= '9')) {
+            return parse_number(v);
+        }
+        return false;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// UTF-8 安全的字节级操作（预算按字节计，故以字节为单位切，且不切断多字节序列）
+// ---------------------------------------------------------------------------
+// 取前 n 个字节（若切到字符中间则回退到最后一个完整字符）
+static std::string u8_prefix(const std::string &s, size_t n) {
+    if (s.size() <= n) return s;
+    size_t k = n;
+    while (k > 0 && ((unsigned char)s[k] & 0xC0) == 0x80) k--;
+    return s.substr(0, k);
+}
+
+// 取后 n 个字节（若切到字符中间则前进到下一个完整字符）
+static std::string u8_suffix(const std::string &s, size_t n) {
+    if (s.size() <= n) return s;
+    size_t st = s.size() - n;
+    while (st < s.size() && ((unsigned char)s[st] & 0xC0) == 0x80) st++;
+    return s.substr(st);
+}
+
+// ---------------------------------------------------------------------------
+// 段内填充（对应 trim.py 的 fill_lines）：
+//   优先整行；单行超过 MAX_LINE_BYTES 先自截到上限再算；
+//   放不下而剩余额度 ≥ MIN_LINE_BYTES+3 时，末行截断后结束本段；
+//   连截断都放不下则丢弃该行、结束本段。整段消耗不超过 cap（used 为累计额度）。
+// ---------------------------------------------------------------------------
+static std::vector<std::string> fill_lines(const std::vector<std::string> &cands,
+                                           size_t cap, size_t &used) {
+    std::vector<std::string> chosen;
+    for (size_t k = 0; k < cands.size(); k++) {
+        const std::string &line = cands[k];
+        std::string disp;
+        size_t want;
+        if (line.size() > (size_t)MAX_LINE_BYTES) {
+            disp = u8_prefix(line, (size_t)MAX_LINE_BYTES) + "\xe2\x80\xa6";
+            want = (size_t)MAX_LINE_BYTES + 3;
+        } else {
+            disp = line;
+            want = line.size();
+        }
+        if (used + want + 1 <= cap) {
+            chosen.push_back(disp);
+            used += want + 1;
+        } else {
+            size_t rem = (cap > used + 1) ? (cap - used - 1) : 0;
+            if (rem >= (size_t)MIN_LINE_BYTES + 3) {
+                chosen.push_back(u8_prefix(line, rem - 3) + "\xe2\x80\xa6");
+                used = cap;
+            }
+            break;
+        }
+    }
+    return chosen;
+}
+
+// ---------------------------------------------------------------------------
+// tool_response -> 文本   （对应 trim.py 的 extract_text）
+// ---------------------------------------------------------------------------
+static bool extract_text(const JVal *resp, std::string &out) {
+    if (!resp) return false;
+
+    if (resp->t == JVal::STR) {
+        out = resp->s;
+        return true;
+    }
+
+    if (resp->t == JVal::ARR) {
+        // 两种真实形状：
+        //   1. MCP 风格 [{"type":"text","text":"..."}]
+        //   2. Grep/Glob 这类直接给字符串数组，每个元素是一行
+        std::vector<std::string> parts;
+        for (size_t k = 0; k < resp->arr.size(); k++) {
+            const JVal &item = resp->arr[k];
+            if (item.t == JVal::OBJ) {
+                const JVal *tx = item.get("text");
+                if (tx && tx->t == JVal::STR) parts.push_back(tx->s);
+            } else if (item.t == JVal::STR) {
+                parts.push_back(item.s);
+            }
+        }
+        if (parts.empty()) return false;
+        out.clear();
+        for (size_t k = 0; k < parts.size(); k++) {
+            if (k) out += '\n';
+            out += parts[k];
+        }
+        return true;
+    }
+
+    if (resp->t == JVal::OBJ) {
+        static const char *TEXT_KEYS[] = {"stdout", "stderr", "output", "text", "content"};
+        std::vector<std::string> parts;
+        for (size_t k = 0; k < 5; k++) {
+            const JVal *v = resp->get(TEXT_KEYS[k]);
+            if (v && v->t == JVal::STR && !v->s.empty()) parts.push_back(v->s);
+        }
+        if (parts.empty()) return false;
+
+        out.clear();
+        for (size_t k = 0; k < parts.size(); k++) {
+            if (k) out += '\n';
+            out += parts[k];
+        }
+
+        // 把非零退出码带上，避免丢失信息
+        const JVal *code = resp->get("exitCode");
+        if (!code) code = resp->get("exit_code");
+        if (code && code->t == JVal::NUM) {
+            long long ic = (long long)code->num;
+            if ((double)ic == code->num && ic != 0) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "[exit code %lld]", ic);
+                out += '\n';
+                out += buf;
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// 裁剪   （对应 trim.py 的 trim；返回 false 表示不需要裁剪）
+//
+// 输出结构：开头行 → [省略标记] → 捞回的关键行 → [末尾标记] → 结尾行
+// 预算按字节计：整体 MAX_BYTES，扣掉标记预留后按段使用；
+// 关键字段与结尾段各有保底额度，前面的段用不完的额度留给后面的段。
+// ---------------------------------------------------------------------------
+static bool trim_text(const std::string &text, std::string &out) {
+    std::vector<std::string> lines;
+    {
+        size_t st = 0;
+        while (true) {
+            size_t p = text.find('\n', st);
+            if (p == std::string::npos) {
+                lines.push_back(text.substr(st));
+                break;
+            }
+            lines.push_back(text.substr(st, p - st));
+            st = p + 1;
+        }
+    }
+
+    const size_t total = lines.size();
+    const size_t tbytes = text.size();
+    const size_t budget_bytes = (size_t)resolve_budget();  // v0.3.5：可用 WB_OPS_BUDGET 覆盖
+
+    if ((int)total <= MAX_LINES && tbytes <= budget_bytes) return false;  // 不长，不动
+
+    if ((int)total <= HEAD_LINES + TAIL_LINES + 5) {
+        // 行数少但字节多（超长单行），按字节截首尾（额度随预算等比缩放；默认 8000 -> 5000/2400）
+        std::string head = u8_prefix(text, budget_bytes * 5 / 8);
+        std::string tail = u8_suffix(text, budget_bytes * 3 / 10);
+        long long omitted = (long long)tbytes - (long long)head.size() - (long long)tail.size();
+        char buf[128];
+        snprintf(buf, sizeof(buf), "\n… [wb-ops 省略 %lld 字节] …\n", omitted);
+        out = head + buf + tail;
+        return true;
+    }
+
+    // ---- 选行：开头 / 结尾按行数取，中间只捞关键字行（超上限则均匀抽样）----
+    std::vector<std::string> head(lines.begin(), lines.begin() + HEAD_LINES);
+    std::vector<std::string> tail(lines.end() - TAIL_LINES, lines.end());
+
+    std::vector<std::string> hits;
+    for (size_t k = HEAD_LINES; k < total - TAIL_LINES; k++) {
+        if (is_key_line(lines[k])) hits.push_back(lines[k]);
+    }
+    std::vector<std::string> key;
+    bool sampled = false;
+    if ((int)hits.size() > MAX_KEY_LINES) {
+        sampled = true;
+        size_t step = (hits.size() + MAX_KEY_LINES - 1) / MAX_KEY_LINES;  // 向上取整
+        for (size_t k = 0; k < hits.size(); k += step) key.push_back(hits[k]);
+    } else {
+        key = hits;
+    }
+
+    // ---- 填预算 ----
+    const size_t budget = budget_bytes - (size_t)MARKER_RESERVE;
+    size_t used = 0;
+    std::vector<std::string> head_shown = fill_lines(head, budget * 40 / 100, used);
+    std::vector<std::string> key_shown = fill_lines(key, budget * 70 / 100, used);
+    std::vector<std::string> tail_rev = fill_lines(
+        std::vector<std::string>(tail.rbegin(), tail.rend()), budget, used);
+    std::vector<std::string> tail_shown(tail_rev.rbegin(), tail_rev.rend());
+
+    // ---- 组装（与 trim.py 逐字节一致）----
+    const long long shown = (long long)head_shown.size() + (long long)key_shown.size() +
+                            (long long)tail_shown.size();
+    const long long silent = (long long)total - shown;
+
+    std::vector<std::string> parts(head_shown);
+    char mbuf[256];
+    if (!key_shown.empty()) {
+        if (sampled) {
+            snprintf(mbuf, sizeof(mbuf),
+                     "… [wb-ops 省略 %lld 行，命中关键字的 %d 条中均匀抽取 %d 条如下] …",
+                     silent, (int)hits.size(), (int)key_shown.size());
+        } else {
+            snprintf(mbuf, sizeof(mbuf),
+                     "… [wb-ops 省略 %lld 行，以下为捞回的 %d 条关键字行] …",
+                     silent, (int)key_shown.size());
+        }
+        parts.push_back(mbuf);
+    } else if (hits.empty()) {
+        snprintf(mbuf, sizeof(mbuf),
+                 "… [wb-ops 省略 %lld 行，未发现 error/warning 关键字] …", silent);
+        parts.push_back(mbuf);
+    } else {
+        snprintf(mbuf, sizeof(mbuf), "… [wb-ops 省略 %lld 行] …", silent);
+        parts.push_back(mbuf);
+    }
+    parts.insert(parts.end(), key_shown.begin(), key_shown.end());
+    if (!tail_shown.empty()) {
+        snprintf(mbuf, sizeof(mbuf), "… [wb-ops 以下为原文末尾 %d 行] …",
+                 (int)tail_shown.size());
+        parts.push_back(mbuf);
+        parts.insert(parts.end(), tail_shown.begin(), tail_shown.end());
+    }
+
+    std::string res;
+    for (size_t k = 0; k < parts.size(); k++) {
+        if (k) res += '\n';
+        res += parts[k];
+    }
+
+    // 兜底硬上界（正常不会触发）
+    if (res.size() > budget_bytes)
+        res = u8_prefix(res, budget_bytes - 3) + "\xe2\x80\xa6";
+
+    out = res;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 序列化：JSON 字符串转义
+// ---------------------------------------------------------------------------
+static void dump_str(const std::string &s, std::string &out) {
+    out += '"';
+    for (size_t k = 0; k < s.size(); k++) {
+        unsigned char c = (unsigned char)s[k];
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += (char)c;
+                }
+        }
+    }
+    out += '"';
+}
+
+static std::string to_str(long long v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", v);
+    return std::string(buf);
+}
+
+// 诊断用：把 tool_response 的类型/键/长度压成一行（仅在 WB_OPS_TRACE 时经 trace 写出）
+static std::string brief(const JVal *v) {
+    if (!v) return "null";
+    char buf[64];
+    if (v->t == JVal::STR) {
+        snprintf(buf, sizeof(buf), "str(%d)", (int)v->s.size());
+        return buf;
+    }
+    if (v->t == JVal::ARR) {
+        snprintf(buf, sizeof(buf), "arr(%d)", (int)v->arr.size());
+        return buf;
+    }
+    if (v->t == JVal::NUM) return "num";
+    if (v->t == JVal::BOOL) return "bool";
+    if (v->t == JVal::OBJ) {
+        std::string r = "obj{";
+        for (size_t k = 0; k < v->obj.size() && k < 10; k++) {
+            if (k) r += ", ";
+            r += v->obj[k].first + "=";
+            const JVal &x = v->obj[k].second;
+            if (x.t == JVal::STR) {
+                snprintf(buf, sizeof(buf), "str(%d)", (int)x.s.size());
+                r += buf;
+            } else if (x.t == JVal::ARR) {
+                snprintf(buf, sizeof(buf), "arr(%d)", (int)x.arr.size());
+                r += buf;
+            } else if (x.t == JVal::NUM) r += "num";
+            else if (x.t == JVal::BOOL) r += "bool";
+            else if (x.t == JVal::OBJ) r += "obj";
+            else r += "null";
+        }
+        r += "}";
+        return r;
+    }
+    return "null";
+}
+
+// ---------------------------------------------------------------------------
+int main() {
+    // 二进制模式：避免 \r\n 转换与 CTRL-Z 截断破坏 JSON
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+
+    std::string raw;
+    {
+        char buf[65536];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) raw.append(buf, n);
+    }
+    if (raw.empty()) return 0;
+    if (raw.size() > 8 * 1024 * 1024) {  // 防极端大输入占用内存（宿主一般远小于此）
+        trace("输入超过 8MB，直接透传");
+        return 0;
+    }
+
+    // 去掉可能的前导 BOM
+    if (raw.size() >= 3 && (unsigned char)raw[0] == 0xEF &&
+        (unsigned char)raw[1] == 0xBB && (unsigned char)raw[2] == 0xBF) {
+        raw.erase(0, 3);
+    }
+
+    JVal root;
+    {
+        Parser p(raw);
+        if (!p.parse(root) || root.t != JVal::OBJ) {
+            if (getenv("WB_OPS_TRACE")) {
+                char info[128];
+                snprintf(info, sizeof(info), "parse fail @ i=%d / len=%d / depth=%d",
+                         (int)p.i, (int)raw.size(), (int)p.depth);
+                size_t st = p.i > 60 ? p.i - 60 : 0;
+                std::string ctx = raw.substr(st, 120);
+                std::string safe;
+                for (size_t k = 0; k < ctx.size(); k++) {
+                    unsigned char u = (unsigned char)ctx[k];
+                    safe += (u >= 0x20 && u < 0x7F) ? (char)u : '.';
+                }
+                trace(std::string(info) + " | ctx=" + safe);
+            }
+            trace("stdin \xe4\xb8\x8d\xe6\x98\xaf\xe5\x90\x88\xe6\xb3\x95 JSON \xe5\xaf\xb9\xe8\xb1\xa1\xef\xbc\x8c\xe9\x80\x8f\xe4\xbc\xa0");
+            return 0;
+        }
+    }
+
+    const JVal *ev = root.get("hook_event_name");
+    if (!ev || ev->t != JVal::STR || ev->s != "PostToolUse") {
+        trace("\xe4\xba\x8b\xe4\xbb\xb6\xe4\xb8\x8d\xe6\x98\xaf PostToolUse\xef\xbc\x8c\xe9\x80\x8f\xe4\xbc\xa0");
+        return 0;
+    }
+
+    const JVal *tn = root.get("tool_name");
+    std::string tool = (tn && tn->t == JVal::STR) ? tn->s : "";
+    if (!is_trim_tool(tool)) {
+        trace(std::string("工具 ") + tool + " 不在裁剪名单，透传 | " +
+              brief(root.get("tool_response")));
+        return 0;
+    }
+
+    std::string text;
+    if (!extract_text(root.get("tool_response"), text) || text.empty()) {
+        trace(std::string("工具 ") + tool + " 输出无法解析为文本，透传 | " +
+              brief(root.get("tool_response")));
+        return 0;
+    }
+
+    std::string trimmed;
+    if (!trim_text(text, trimmed)) {
+        trace(std::string("\xe5\xb7\xa5\xe5\x85\xb7 ") + tool +
+              " \xe8\xbe\x93\xe5\x87\xba\xe4\xb8\x8d\xe9\x95\xbf\xef\xbc\x8c\xe4\xb8\x8d\xe8\xa3\x81");
+        return 0;
+    }
+
+    trace(std::string("工具 ") + tool + " 已裁剪：" + to_str((long long)text.size()) +
+          " -> " + to_str((long long)trimmed.size()) + " 字节");
+
+    // v0.3.0 节省记账（默认开启；失败静默，绝不影响裁剪输出）
+    {
+        const JVal *sidv = root.get("session_id");
+        stats(tool, (sidv && sidv->t == JVal::STR) ? sidv->s : std::string(""),
+              (long long)text.size(), (long long)trimmed.size());
+    }
+
+    std::string out = "{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"updatedToolOutput\":";
+    dump_str(trimmed, out);
+    out += "},\"suppressOutput\":true}";
+
+    fwrite(out.data(), 1, out.size(), stdout);
+    fflush(stdout);
+    return 0;
+}
