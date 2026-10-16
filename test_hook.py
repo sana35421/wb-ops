@@ -27,11 +27,12 @@ import subprocess
 import sys
 import tempfile
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-HOOK = os.path.join(HERE, "hooks", "trim.py")
-GUARD = os.path.join(HERE, "hooks", "memory-guard.mjs")
-CTX_GUARD = os.path.join(HERE, "hooks", "ctx-guard.mjs")
-PRECOMPACT = os.path.join(HERE, "hooks", "precompact.mjs")
+HERE = os.path.dirname(os.path.abspath(__file__))  # 仓库根
+PLUGIN = os.path.join(HERE, "plugins", "wb-ops")  # 插件本体（官方市场结构）
+HOOK = os.path.join(PLUGIN, "hooks", "trim.py")
+GUARD = os.path.join(PLUGIN, "hooks", "memory-guard.mjs")
+CTX_GUARD = os.path.join(PLUGIN, "hooks", "ctx-guard.mjs")
+PRECOMPACT = os.path.join(PLUGIN, "hooks", "precompact.mjs")
 # v0.3.0 起：测试流量不写入真实记账数据（~/.workbuddy/wb-ops-data/）
 os.environ["WB_OPS_STATS"] = "0"
 
@@ -309,7 +310,7 @@ def main():
 
             # 5g: hooks.json 四事件注册且语法合法
             try:
-                with open(os.path.join(HERE, "hooks", "hooks.json"), encoding="utf-8") as f:
+                with open(os.path.join(PLUGIN, "hooks", "hooks.json"), encoding="utf-8") as f:
                     events = set(json.load(f).get("hooks", {}).keys())
                 good = {"PostToolUse", "SessionStart", "UserPromptSubmit", "PreCompact"} <= events
             except Exception:

@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 
 # 运行 / 调试产物
-bin/trace.log
+plugins/wb-ops/bin/trace.log
 TRACE-ON
 _*.log
 

@@ -27,9 +27,10 @@ try:
 except Exception:
     pass
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-EXE = os.path.join(ROOT, "bin", "wb-ops-trim.exe")
-PY_IMPL = os.path.join(ROOT, "hooks", "trim.py")
+ROOT = os.path.dirname(os.path.abspath(__file__))  # 仓库根
+PLUGIN = os.path.join(ROOT, "plugins", "wb-ops")  # 插件本体（官方市场结构）
+EXE = os.path.join(PLUGIN, "bin", "wb-ops-trim.exe")
+PY_IMPL = os.path.join(PLUGIN, "hooks", "trim.py")
 PYTHON = sys.executable
 # v0.3.0 起：测试流量不写入真实记账数据（~/.workbuddy/wb-ops-data/）
 os.environ["WB_OPS_STATS"] = "0"

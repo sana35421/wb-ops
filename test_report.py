@@ -21,10 +21,12 @@ from datetime import datetime
 from contextlib import ExitStack
 from html.parser import HTMLParser
 from unittest.mock import patch
-import report
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPORT = os.path.join(HERE, "report.py")
+HERE = os.path.dirname(os.path.abspath(__file__))  # 仓库根
+PLUGIN = os.path.join(HERE, "plugins", "wb-ops")  # 插件本体（官方市场结构）
+sys.path.insert(0, PLUGIN)  # 让下方 `import report` 命中插件内的 report.py
+import report  # noqa: E402  （须在 sys.path 调整之后导入）
+REPORT = os.path.join(PLUGIN, "report.py")
 PY = sys.executable
 ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
 

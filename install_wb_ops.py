@@ -12,7 +12,7 @@ WorkBuddy 通过三个注册表文件管理插件，本脚本按它们的实际�
 
 用法：
     python install_wb_ops.py            安装
-    python install_wb_ops.py sync       只把本目录内容同步进市场副本 + 安装快照（日常改代码后用）
+    python install_wb_ops.py sync       只把插件目录（plugins/wb-ops）内容同步进市场副本 + 安装快照（日常改代码后用）
     python install_wb_ops.py uninstall  卸载（恢复备份并删除市场目录）
     python install_wb_ops.py status     查看当前状态
     python install_wb_ops.py gc         清理旧版本安装快照（默认只预演，加 --yes 执行）
@@ -43,7 +43,24 @@ PLUGIN_DIR = os.path.join(MARKET_DIR, "plugins", PLUGIN)
 #   plugins/cache/<市场>/<插件>/<版本>/
 # 只写 installed_plugins.json 而不落这份副本，插件会被跳过（扫描时静默 continue）。
 CACHE_DIR = os.path.join(PLUGINS, "cache", MARKETPLACE, PLUGIN, VERSION)
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # 开发目录（本脚本所在处）
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # 仓库根（本脚本所在处）
+
+
+def _locate_plugin_src():
+    """定位插件内容目录。
+
+    官方市场结构下插件本体位于 仓库根/plugins/wb-ops；
+    兼容把本脚本直接拷进插件目录内单独运行的历史用法（此时本目录即插件本体）。
+    """
+    repo_layout = os.path.join(SCRIPT_DIR, "plugins", PLUGIN)
+    if os.path.isdir(os.path.join(repo_layout, ".codebuddy-plugin")):
+        return repo_layout
+    if os.path.isdir(os.path.join(SCRIPT_DIR, ".codebuddy-plugin")):
+        return SCRIPT_DIR
+    return repo_layout
+
+
+PLUGIN_SRC = _locate_plugin_src()  # 插件源目录：安装/同步都从这里复制
 
 # 同步时排除：非插件内容 / 备份 / 日志
 SYNC_IGNORE = shutil.ignore_patterns(
@@ -77,7 +94,7 @@ def write_json(path, data, backup=True):
 
 
 def sync():
-    """把开发目录（本脚本所在目录）的当前内容同步进市场副本和安装快照。
+    """把插件源目录（PLUGIN_SRC）的当前内容同步进市场副本和安装快照。
 
     日常改完代码后跑这个：宿主真正加载的是 cache 快照，只改开发目录不生效。
     增量覆盖发布副本，不删除目录；同步成功后对齐注册表；幂等，可反复跑。
@@ -90,7 +107,7 @@ def sync():
 
     # 防版本漂移：本脚本 VERSION 必须与 plugin.json 一致，否则同步出「版本对不上」的快照
     try:
-        pj = read_json(os.path.join(SCRIPT_DIR, ".codebuddy-plugin", "plugin.json"))
+        pj = read_json(os.path.join(PLUGIN_SRC, ".codebuddy-plugin", "plugin.json"))
         if pj.get("version") != VERSION:
             print("! 版本不一致：plugin.json=%s / 本脚本 VERSION=%s，请先统一再同步"
                   % (pj.get("version"), VERSION))
@@ -99,12 +116,14 @@ def sync():
         print("! 读取 plugin.json 失败：%s" % e)
         return 1
 
-    # 发布只增量覆盖，不清空用户目录或旧快照。两处均从开发目录复制，
+    # 发布只增量覆盖，不清空用户目录或旧快照。两处均从插件源目录（PLUGIN_SRC）复制，
     # 避免市场副本内的历史文件被带进新的版本快照。
-    shutil.copytree(SCRIPT_DIR, PLUGIN_DIR, ignore=SYNC_IGNORE, dirs_exist_ok=True)
+    shutil.copytree(PLUGIN_SRC, PLUGIN_DIR, ignore=SYNC_IGNORE, dirs_exist_ok=True)
     print("  + 市场副本 %s" % PLUGIN_DIR)
 
-    shutil.copytree(SCRIPT_DIR, CACHE_DIR, ignore=SYNC_IGNORE, dirs_exist_ok=True)
+    shutil.copytree(PLUGIN_SRC, CACHE_DIR, ignore=SYNC_IGNORE, dirs_exist_ok=True)
+    if write_marketplace_manifest():
+        print("  + 市场清单 %s" % os.path.join(MARKET_DIR, ".codebuddy-plugin", "marketplace.json"))
     print("  + 安装快照 %s" % CACHE_DIR)
 
     # 注册表一致性：宿主按 installed_plugins.json 的 installPath 加载插件。
@@ -121,6 +140,31 @@ def sync():
         print("提示：cache 下另有 %d 个旧版本快照（%s），可运行 python install_wb_ops.py gc 查看/清理。"
               % (len(stale), ", ".join(stale)))
     return 0
+
+
+def write_marketplace_manifest():
+    """把仓库根的市场清单写入市场目录（宿主按「清单 + plugins/」的官方结构校验市场）。
+
+    主动铺一份 marketplace.json：较新宿主检查到已注册市场缺少本地快照时
+    会告警并尝试从声明的源修复，主动补齐可避免这一状态。
+    name 改写为本市场名（MARKETPLACE），与 known_marketplaces.json 保持一致；
+    仅当脚本运行于仓库根（存在 .codebuddy-plugin/marketplace.json）时生效。
+    """
+    src = os.path.join(SCRIPT_DIR, ".codebuddy-plugin", "marketplace.json")
+    if not os.path.isfile(src):
+        return False
+    try:
+        mf = read_json(src)
+    except Exception as e:
+        print("  ! 读取市场清单失败：%s（跳过）" % e)
+        return False
+    mf["name"] = MARKETPLACE
+    dst_dir = os.path.join(MARKET_DIR, ".codebuddy-plugin")
+    os.makedirs(dst_dir, exist_ok=True)
+    with open(os.path.join(dst_dir, "marketplace.json"), "w", encoding="utf-8") as f:
+        json.dump(mf, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return True
 
 
 def sync_registry():
@@ -161,11 +205,11 @@ def install():
     print("安装 %s ..." % PLUGIN_ID)
     print()
 
-    # 从 clone / 解压目录直接运行（脚本目录 ≠ 市场插件目录）时，先把本目录铺进市场目录；
+    # 从 clone / 解压目录直接运行（插件源目录 ≠ 市场插件目录）时，先把插件本源铺进市场目录；
     # 用户 git clone 后直接 `python install_wb_ops.py` 即可完成安装。
-    if os.path.normcase(os.path.abspath(SCRIPT_DIR)) != os.path.normcase(os.path.abspath(PLUGIN_DIR)):
+    if os.path.normcase(os.path.abspath(PLUGIN_SRC)) != os.path.normcase(os.path.abspath(PLUGIN_DIR)):
         os.makedirs(PLUGIN_DIR, exist_ok=True)
-        shutil.copytree(SCRIPT_DIR, PLUGIN_DIR, ignore=SYNC_IGNORE, dirs_exist_ok=True)
+        shutil.copytree(PLUGIN_SRC, PLUGIN_DIR, ignore=SYNC_IGNORE, dirs_exist_ok=True)
         print("  + 市场插件目录 %s" % PLUGIN_DIR)
 
     if not os.path.isdir(PLUGIN_DIR):
@@ -185,6 +229,8 @@ def install():
         "autoUpdate": False,
     }
     write_json(KNOWN, km)
+    if write_marketplace_manifest():
+        print("  + 市场清单 .codebuddy-plugin/marketplace.json")
     print("  + %s -> %s" % (MARKETPLACE, MARKET_DIR))
 
     # ---- 2. 落安装快照到 cache/<市场>/<插件>/<版本>/ ----

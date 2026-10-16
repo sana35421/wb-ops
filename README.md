@@ -43,7 +43,16 @@ wb-ops 在四个位置介入，把这个成本压下去：
 - Python 3.8+（安装脚本 + Python 回退实现）
 - Node.js 18+（两个 `.mjs` 守卫的运行时；系统无 node 时会探测 WorkBuddy 自带位置）
 
-**一键安装**
+**方式一：通过 WorkBuddy 插件市场安装（推荐）**
+
+本仓库同时就是一个标准的 WorkBuddy 插件市场（根目录 `.codebuddy-plugin/marketplace.json` +
+`plugins/wb-ops/` 插件本体），直接添加即可：
+
+1. 打开 WorkBuddy 的**插件页面**，进入其中的**插件市场**列表
+2. 点击**添加市场**，输入 `sana35421/wb-ops`（支持 `owner/repo` 简写或完整 URL）
+3. 在市场列表中找到 `wb-ops`，点击**安装**，按提示启用
+
+**方式二：克隆 + 一键脚本**
 
 ```bash
 git clone https://github.com/sana35421/wb-ops.git
@@ -51,10 +60,13 @@ cd wb-ops
 python install_wb_ops.py
 ```
 
-脚本会自动完成全部四步：注册本地插件市场 → 把本目录铺进市场插件目录 → 生成安装快照 →
-写入启用开关。完成后**重启 WorkBuddy（或执行 `/reload-plugins`）生效**，之后新开的会话自动加载。
+脚本会自动完成全部四步：注册本地插件市场 → 把插件本体（`plugins/wb-ops/`）铺进市场插件目录 →
+生成安装快照 → 写入启用开关。完成后**重启 WorkBuddy（或执行 `/reload-plugins`）生效**，之后新开的会话自动加载。
 
 **更新 / 卸载**
+
+- 市场方式：在插件市场页面**刷新市场**即可拉取新版本；不再需要时在同一页面卸载
+- 脚本方式：
 
 ```bash
 git pull && python install_wb_ops.py sync   # 更新到最新版
@@ -73,9 +85,10 @@ python install_wb_ops.py status             # 查看注册状态
 ### 报告后台
 
 ```bash
-python report.py             # 生成并打开 dashboard.html（单文件、零依赖）
-python report.py --serve     # 实时服务：http://127.0.0.1:8787/，页面每 30s 自动刷新
-python report.py --demo      # 合成数据，预览版式
+# 在仓库根目录执行；插件安装后，在插件安装目录里可直接跑 report.py
+python plugins/wb-ops/report.py             # 生成并打开 dashboard.html（单文件、零依赖）
+python plugins/wb-ops/report.py --serve     # 实时服务：http://127.0.0.1:8787/，页面每 30s 自动刷新
+python plugins/wb-ops/report.py --demo      # 合成数据，预览版式
 ```
 
 或直接在会话里用斜杠命令：`/wb-ops:report`（支持 `serve` / `demo` / `no-prune` / `out=<路径>` 参数）。
@@ -109,6 +122,8 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 
 ## 工作原理
 
+> 下图中路径均为插件包内相对路径（对应仓库的 `plugins/wb-ops/` 目录）。
+
 ```
 【裁剪链路】每次 Grep / Glob / WebFetch
   工具调用 ──> PostToolUse hook（hooks/hooks.json）
@@ -140,7 +155,7 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 
 - **宿主依赖**：本插件依据 WorkBuddy 5.8.x 的 hook 协议与 transcript 格式开发。
   宿主升级可能影响部分功能（尤其守卫与报告），届时欢迎提 issue；不承诺长期兼容。
-- **平台**：Windows 已验证（含预编译 `bin/wb-ops-trim.exe`）。
+- **平台**：Windows 已验证（含预编译 `plugins/wb-ops/bin/wb-ops-trim.exe`）。
   macOS / Linux 可用 Python 回退路径，但未实测——欢迎 PR 验证。
 - **隐私**：零网络请求、零遥测；所有数据只在本机读写。
   账本只记录尺寸 / 时间 / 会话前缀；报告为本地单文件。
@@ -152,30 +167,34 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 
 | 路径 | 作用 |
 |---|---|
-| `src/trim.cpp` | 裁剪器原生实现（唯一需要编译的文件） |
-| `bin/wb-ops-trim.exe` | 预编译二进制（静态链接，无 DLL 依赖） |
-| `hooks/trim.py` | Python 回退实现（与 C++ 逐字节一致） |
-| `hooks/hooks.json` | hook 注册（四事件：PostToolUse / SessionStart / UserPromptSubmit / PreCompact） |
-| `hooks/ctx-guard.mjs` | 上下文守卫 v2（学习 / 双档提醒 / 压缩后检查） |
-| `hooks/memory-guard.mjs` | 记忆守卫（SessionStart） |
-| `hooks/precompact.mjs` | 压缩保留清单注入（PreCompact） |
-| `report.py` | 报告生成器（纯标准库） |
-| `commands/report.md` | `/wb-ops:report` 斜杠命令 |
-| `install_wb_ops.py` | 安装 / 更新 / 卸载 / 状态 / 清理 |
+| `.codebuddy-plugin/marketplace.json` | 市场清单（官方插件市场入口，声明 wb-ops 插件） |
+| `plugins/wb-ops/` | **插件本体**（安装时打包/复制的就是这个目录） |
+| `plugins/wb-ops/src/trim.cpp` | 裁剪器原生实现（唯一需要编译的文件） |
+| `plugins/wb-ops/bin/wb-ops-trim.exe` | 预编译二进制（静态链接，无 DLL 依赖） |
+| `plugins/wb-ops/hooks/trim.py` | Python 回退实现（与 C++ 逐字节一致） |
+| `plugins/wb-ops/hooks/hooks.json` | hook 注册（四事件：PostToolUse / SessionStart / UserPromptSubmit / PreCompact） |
+| `plugins/wb-ops/hooks/ctx-guard.mjs` | 上下文守卫 v2（学习 / 双档提醒 / 压缩后检查） |
+| `plugins/wb-ops/hooks/memory-guard.mjs` | 记忆守卫（SessionStart） |
+| `plugins/wb-ops/hooks/precompact.mjs` | 压缩保留清单注入（PreCompact） |
+| `plugins/wb-ops/report.py` | 报告生成器（纯标准库） |
+| `plugins/wb-ops/commands/report.md` | `/wb-ops:report` 斜杠命令 |
+| `install_wb_ops.py` | 一键安装 / 更新 / 卸载 / 状态 / 清理（脚本方式） |
+| `build.sh` | 重新编译原生裁剪器（改 `src/trim.cpp` 后） |
 | `test_*.py` | 测试：一致性 46 + hook 29 + 报告 50 + 稳定性 273 |
 | `docs/` | 机制调研、设计文档与测试报告 |
 
 ## 开发
 
 ```bash
-# 编译（改 src/trim.cpp 后；需要 MSYS2 MinGW-w64）
+# 编译（改 plugins/wb-ops/src/trim.cpp 后；需要 MSYS2 MinGW-w64）
 bash build.sh
 
 # 测试（约 3 分钟，398 项）
-python test_parity.py && python test_stability.py && python test_hook.py && python test_report.py
+python test_hook.py && python test_parity.py && python test_stability.py && python test_report.py
 ```
 
-改动代码后的发布流程：升版本号（`.codebuddy-plugin/plugin.json` 与 `install_wb_ops.py` 两处）
+改动代码后的发布流程：升版本号（`plugins/wb-ops/.codebuddy-plugin/plugin.json`、根目录
+`.codebuddy-plugin/marketplace.json`、`install_wb_ops.py` 里的 `VERSION` 三处保持一致）
 → `python install_wb_ops.py sync`。新版本按会话进程粒度生效，无需重启应用。
 
 ## 文档索引

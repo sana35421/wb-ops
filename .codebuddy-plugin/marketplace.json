@@ -1,0 +1,24 @@
+{
+  "name": "wb-ops",
+  "description": "WorkBuddy 上下文治理插件市场：工具输出裁剪、上下文守卫 v2、记忆守卫、压缩保留清单与用量看板。",
+  "owner": {
+    "name": "sana35421",
+    "email": ""
+  },
+  "plugins": [
+    {
+      "name": "wb-ops",
+      "description": "压缩冗长的工具输出，减少上下文 token 消耗；上下文守卫 v2（学习各模型压缩点 / 双档提醒 / 压缩后检查）+ PreCompact 压缩保留清单。C++/Python 双实现，398 项测试全绿。",
+      "version": "0.6.0",
+      "source": "./plugins/wb-ops",
+      "license": "MIT",
+      "keywords": [
+        "token",
+        "context",
+        "hooks",
+        "performance"
+      ],
+      "category": "开发工具"
+    }
+  ]
+}

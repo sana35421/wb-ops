@@ -18,9 +18,10 @@ import sys
 import tempfile
 import time
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-PY_SCRIPT = os.path.join(ROOT, "hooks", "trim.py")
-EXE = os.path.join(ROOT, "bin", "wb-ops-trim.exe")
+ROOT = os.path.dirname(os.path.abspath(__file__))  # 仓库根
+PLUGIN = os.path.join(ROOT, "plugins", "wb-ops")  # 插件本体（官方市场结构）
+PY_SCRIPT = os.path.join(PLUGIN, "hooks", "trim.py")
+EXE = os.path.join(PLUGIN, "bin", "wb-ops-trim.exe")
 PYTHON = sys.executable
 
 
@@ -460,7 +461,7 @@ def main():
                                     "PortableGit", "versions", "*", "bin", "bash.exe"))
         bash = _g[0] if _g else ""
     if bash and os.path.exists(bash):
-        root_msys = to_msys(ROOT)  # 永远指向当前所在的这份代码，不再硬编码旧路径
+        root_msys = to_msys(PLUGIN)  # 永远指向当前所在的这份代码（插件本体），不再硬编码旧路径
         cmd_new = '"%s/bin/wb-ops-trim.exe" 2>/dev/null || exit 0' % root_msys
         env = {"CODEBUDDY_PLUGIN_ROOT": root_msys, "PATH": "/usr/bin:/bin",
                "TMP": "/tmp", "WB_OPS_STATS": "0"}
