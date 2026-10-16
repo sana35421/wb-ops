@@ -1,5 +1,5 @@
 {
-  "description": "wb-ops: 工具输出压缩（Grep/Glob/WebFetch）+ 记忆守卫（SessionStart 检查用户记忆超限并提醒精简）+ 上下文守卫 v2（UserPromptSubmit：学习各模型真实自动压缩点、双档提醒、压缩后水位检查）+ 压缩指令注入（PreCompact：为压缩摘要注入保留清单）",
+  "description": "wb-ops: 工具输出压缩（Grep/Glob/WebFetch）+ 记忆守卫（SessionStart 检查用户记忆超限并提醒精简）+ 上下文守卫 v2（UserPromptSubmit：学习各模型真实自动压缩点、三档提醒、压缩后水位检查）+ 压缩指令注入（PreCompact：为压缩摘要注入保留清单）",
   "hooks": {
     "UserPromptSubmit": [
       {

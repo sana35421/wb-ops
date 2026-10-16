@@ -4,7 +4,7 @@
 会话临近自动压缩点之前主动提醒（省心），记忆文件超限时自动收拾（防截断），
 并自带一本"省了多少"的账与可视化报告后台。
 
-当前版本 **0.6.1** ｜ 宿主 WorkBuddy 5.8.2（Windows 实测） ｜ [MIT License](LICENSE)
+当前版本 **0.6.2** ｜ 宿主 WorkBuddy 5.8.2（Windows 实测） ｜ [MIT License](LICENSE)
 
 ---
 
@@ -16,7 +16,7 @@ wb-ops 在四个位置介入，把这个成本压下去：
 | # | 链路 | 时机 | 做什么 |
 |---|------|------|--------|
 | 1 | **输出裁剪** | 每次 Grep / Glob / WebFetch 之后 | 长输出压缩到预算内再进上下文（默认 ≤ 8000 字节），关键行与结尾优先保留 |
-| 2 | **上下文守卫 v2** | 每次提交消息时 | 学习各模型真实的自动压缩触发点，在越过"强档线 / 轻档线"时提醒收尾或换新会话 |
+| 2 | **上下文守卫 v2** | 每次提交消息时 | 学习各模型真实的自动压缩触发点，三档提醒（轻档 / 强档 / 越过压缩点仍未触发）收尾或换新会话 |
 | 3 | **记忆守卫** | 新会话启动时 | 用户级记忆超限（默认 3500 字符）时自动压缩（带备份），防止被宿主静默截断 |
 | 4 | **压缩保留清单** | 宿主执行自动压缩时 | 注入"什么必须保留"（任务目标 / 未决事项 / 关键决策…），让压缩摘要不失忆 |
 
@@ -30,7 +30,7 @@ wb-ops 在四个位置介入，把这个成本压下去：
 | 重型会话输入重放 | **-81%** | 与"从未压缩"反事实对照（518 次请求的重型会话） |
 | 截断开销 | 原生 exe 纯处理 **~2.4ms**（含进程启动 ~70ms） | 经 bash 包装后整体 ~0.3s/次（仅 Grep/Glob） |
 | 守卫开销 | 每消息 ~0.26s（尾部直读） | 未达阈值零输出、零注入 |
-| 测试覆盖 | **419 项全绿** | 边界 / fuzz / 并发 / 长跑 / 双实现逐字节一致 |
+| 测试覆盖 | **420 项全绿** | 边界 / fuzz / 并发 / 长跑 / 双实现逐字节一致 |
 
 > 裁剪不是"砍内容"：ERROR / warning 关键字行、结尾段、命中抽样会按规则优先保留，
 > 并附带显式省略标记（`… [wb-ops 省略 N 行，……] …`），模型可据此校准信任度。
@@ -139,7 +139,7 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 【守卫链路】新会话启动 / 每次提交消息 / 宿主压缩时
   SessionStart ──> hooks/memory-guard.mjs   检查用户记忆字符数，超限注入压缩指令
   UserPromptSubmit ──> hooks/ctx-guard.mjs  尾部直读 transcript 得上下文水位；
-                                            学习各模型压缩触发点 → 双档提醒 → 压缩后检查
+                                            学习各模型压缩触发点 → 三档提醒 → 压缩后检查
   PreCompact ──> hooks/precompact.mjs       stdout 输出保留清单 → 注入压缩摘要过程
 
 【报告链路】python report.py（或 /wb-ops:report）
@@ -173,7 +173,7 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 | `plugins/wb-ops/bin/wb-ops-trim.exe` | 预编译二进制（静态链接，无 DLL 依赖） |
 | `plugins/wb-ops/hooks/trim.py` | Python 回退实现（与 C++ 逐字节一致） |
 | `plugins/wb-ops/hooks/hooks.json` | hook 注册（四事件：PostToolUse / SessionStart / UserPromptSubmit / PreCompact） |
-| `plugins/wb-ops/hooks/ctx-guard.mjs` | 上下文守卫 v2（学习 / 双档提醒 / 压缩后检查） |
+| `plugins/wb-ops/hooks/ctx-guard.mjs` | 上下文守卫 v2（学习 / 三档提醒 / 压缩后检查） |
 | `plugins/wb-ops/hooks/memory-guard.mjs` | 记忆守卫（SessionStart） |
 | `plugins/wb-ops/hooks/precompact.mjs` | 压缩保留清单注入（PreCompact） |
 | `plugins/wb-ops/report.py` | 报告生成器（纯标准库） |
@@ -189,7 +189,7 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 # 编译（改 plugins/wb-ops/src/trim.cpp 后；需要 MSYS2 MinGW-w64）
 bash build.sh
 
-# 测试（约 3–4 分钟，419 项）
+# 测试（约 3–4 分钟，420 项）
 python test_hook.py && python test_parity.py && python test_stability.py && python test_report.py
 ```
 

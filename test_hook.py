@@ -13,6 +13,7 @@ wb-ops / 裁剪 hook 的自测
     5. 基础：超线注入 / 同档节流 / 小上下文静默 / 内部延续静默 / 非法阈值回退 / 关闭开关 / 事件注册（四事件）
        v2 专项：auto 样本学习 / 手动样本排除 / 学习线生效 / 压缩后 >100K 告警 / ≤100K 静默 /
                 pending 时序 / env 覆盖轻档线 / 垃圾输入静默 / 状态文件 v2 格式
+       v0.6.2：越过实测压缩点仍未触发 → band 3 强提醒（点明"自动压缩没触发"机理）
 另检查 PreCompact hook（v0.6.0 起，压缩保留清单注入）：
     6. 保留清单输出 / 空 stdin 容错 / 垃圾输入容错
 
@@ -488,6 +489,24 @@ def main():
             if status == "FAIL":
                 ok = False
             print("[5m] v2 env 覆盖+状态格式 %s" % status)
+
+            # 5o（v0.6.2）: 越过实测压缩点仍未触发 → band 3 强提醒（点明"自动压缩没触发"机理）
+            sd = os.path.join(tmp, "v2o"); os.makedirs(sd)
+            tp = wl(os.path.join(tmp, "v2o.jsonl"), [
+                ul(152800, "r1", "deepseek-v4.1-flash"), cl(1, "pre-message-auto", "auto", "o1"),
+                ul(60000, "r2"), ul(160000, "r3"),
+            ])
+            out, code = run_ctx_guard({**payload, "session_id": "v2o00001", "transcript_path": tp}, sd)
+            try:
+                ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+                good = (code == 0 and "已越过" in ctx and "160K" in ctx
+                        and "/compact" in ctx and "发送消息" in ctx)
+            except Exception:
+                good = False
+            status = "PASS" if good else "FAIL"
+            if status == "FAIL":
+                ok = False
+            print("[5o] v2 越过压缩点强提醒 %s" % status)
 
             # 5n: 事件名不符 / 垃圾 stdin / 空 stdin / 空对象 → 静默且不崩
             checks = []

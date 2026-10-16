@@ -538,6 +538,7 @@ tr:last-child td { border-bottom:none; }
 .foot b { color:#c5cedb; font-weight:500; }
 .banner { background:#dfbd8808; border:1px solid #dfbd8828; color:#dfbd88;
   border-radius:8px; padding:10px 15px; font-size:12px; margin-bottom:24px; }
+.banner-tip { background:#74e6bf0d; border-color:#74e6bf2e; color:#74e6bf; }
 code { background:#ffffff06; border-radius:4px; padding:2px 6px; font-size:11px; color:#acc3e6; overflow-wrap:anywhere; }
 @keyframes rise { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:none; } }
 @keyframes grow { from { transform:scale(.02,.02); opacity:.1; } to { transform:scale(1,1); opacity:1; } }
@@ -857,6 +858,12 @@ def render_html(agg, meta):
       % (esc(meta['data_dir']), esc(meta.get('title_note') or '本地报告'), esc(meta.get('files', 0)), esc(meta.get('bad', 0))))
     A('<noscript><div class="banner">JavaScript 未启用：所有数据仍完整可读；搜索与手动刷新不可用。%s</div></noscript>'
       % ('本地服务将每 %d 秒整页刷新。' % refresh if served and refresh else '此页面不会自动刷新。'))
+    if not served and not meta.get("demo"):
+        # v0.6.2：静态快照主动引导开启实时版（回应"后台不是动态更新"的困惑）
+        A("<div class='banner banner-tip'>当前为静态快照，生成后不会自动更新。"
+          "想看实时版（浏览器每次访问都现场重算、每 30 秒自动刷新）："
+          "运行 <code>python report.py --serve</code> 或斜杠命令 <code>/wb-ops:report serve</code>，"
+          "再打开 <code>http://127.0.0.1:8787/</code>。</div>")
     if meta.get("demo"):
         A("<div class='banner'>示意报告：以下为全合成演示数据，仅预览版式，不代表真实使用情况。</div>")
     else:
