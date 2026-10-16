@@ -4,7 +4,7 @@
 会话临近自动压缩点之前主动提醒（省心），记忆文件超限时自动收拾（防截断），
 并自带一本"省了多少"的账与可视化报告后台。
 
-当前版本 **0.6.0** ｜ 宿主 WorkBuddy 5.8.2（Windows 实测） ｜ [MIT License](LICENSE)
+当前版本 **0.6.1** ｜ 宿主 WorkBuddy 5.8.2（Windows 实测） ｜ [MIT License](LICENSE)
 
 ---
 
@@ -26,11 +26,11 @@ wb-ops 在四个位置介入，把这个成本压下去：
 
 | 指标 | 数据 | 口径 |
 |---|---|---|
-| 单次大输出裁剪 | **80–97%** | 真实 grep 输出 50KB → 10KB；3000 行 → 8KB |
+| 单次大输出裁剪 | **大输入约 80–95%** | 接近阈值的小输入可能不足 80%；50KB → ≤8KB（硬上界，实测约 4.8KB）；3000 行 → ≤8KB（实测约 1.9KB） |
 | 重型会话输入重放 | **-81%** | 与"从未压缩"反事实对照（518 次请求的重型会话） |
-| 截断开销 | 原生 exe 单次 ~5ms | 经 bash 包装后整体 ~0.3s/次（仅 Grep/Glob） |
+| 截断开销 | 原生 exe 纯处理 **~2.4ms**（含进程启动 ~70ms） | 经 bash 包装后整体 ~0.3s/次（仅 Grep/Glob） |
 | 守卫开销 | 每消息 ~0.26s（尾部直读） | 未达阈值零输出、零注入 |
-| 测试覆盖 | **398 项全绿** | 边界 / fuzz / 并发 / 长跑 / 双实现逐字节一致 |
+| 测试覆盖 | **419 项全绿** | 边界 / fuzz / 并发 / 长跑 / 双实现逐字节一致 |
 
 > 裁剪不是"砍内容"：ERROR / warning 关键字行、结尾段、命中抽样会按规则优先保留，
 > 并附带显式省略标记（`… [wb-ops 省略 N 行，……] …`），模型可据此校准信任度。
@@ -70,7 +70,7 @@ python install_wb_ops.py
 
 ```bash
 git pull && python install_wb_ops.py sync   # 更新到最新版
-python install_wb_ops.py uninstall          # 卸载（恢复安装前的注册表备份）
+python install_wb_ops.py uninstall          # 卸载（按字段移除本插件注册条目，只删本插件目录/快照）
 python install_wb_ops.py status             # 查看注册状态
 ```
 
@@ -128,7 +128,7 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 【裁剪链路】每次 Grep / Glob / WebFetch
   工具调用 ──> PostToolUse hook（hooks/hooks.json）
                  │
-                 ├─ bin/wb-ops-trim.exe          ← 原生实现（~5ms，静态编译）
+                 ├─ bin/wb-ops-trim.exe          ← 原生实现（纯处理 ~2.4ms，静态编译）
                  │    └─ 不可用时回退 hooks/trim.py（Python，逐字节一致）
                  │
                  ├─ stdout: {"hookSpecificOutput":{"updatedToolOutput":"裁剪后输出"}}
@@ -189,7 +189,7 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 # 编译（改 plugins/wb-ops/src/trim.cpp 后；需要 MSYS2 MinGW-w64）
 bash build.sh
 
-# 测试（约 3 分钟，398 项）
+# 测试（约 3–4 分钟，419 项）
 python test_hook.py && python test_parity.py && python test_stability.py && python test_report.py
 ```
 

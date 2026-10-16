@@ -199,6 +199,8 @@ def build_edges():
                payload_of("Grep", "z" * (8 * MB - 4096)), "trim"))
     cs.append(("8MB+1KB 护栏透传",
                payload_of("Grep", "z" * (8 * MB + 1024)), "pass"))
+    # v0.6.1（S9）：退化输入输出不比原文小 —— 应透传而不是越裁越大
+    cs.append(("121 行空行（越裁越大→透传）", payload_of("Grep", "\n" * 120), "pass"))
     return cs
 
 

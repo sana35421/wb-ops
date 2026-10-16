@@ -7,6 +7,7 @@
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -96,6 +97,8 @@ def case_real_fake_ledger():
         # 总节省 = (50000-6000) + (20000-4000) = 60000 字节 -> hb() 口径 "58.6 KB"
         check("节省数字入报告", "58.6 KB" in html)
         check("工具名入报告", "Grep" in html and "Glob" in html)
+        # v0.6.1（S7）：宿主库缺失 -> 页面顶部出现降级 banner（区分「无数据」与「读库失败」）
+        check("宿主降级 banner 入页", "宿主数据库读取失败" in html)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -297,6 +300,29 @@ def case_dashboard_ui():
     check("图表提示文字转义", "&lt;unsafe&gt;" in report.bar_svg([("<unsafe>", 10)], "#74e6bf", str))
 
 
+def case_bad_timestamp():
+    print("\n[7] S2：越界时间戳计入损坏行，不再拖崩报告")
+    tmp = tempfile.mkdtemp(prefix="wbops-rep-badts-")
+    try:
+        fp = os.path.join(tmp, "saves-%s.jsonl" % datetime.now().strftime("%Y%m"))
+        with open(fp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"t": 1750000000000, "s": "aaaa1111", "tool": "Grep",
+                                "b": 9000, "a": 500}) + "\n")
+            f.write(json.dumps({"t": 99999999999999999999, "s": "aaaa1111", "tool": "Grep",
+                                "b": 9000, "a": 500}) + "\n")
+            f.write(json.dumps({"t": -5, "s": "aaaa1111", "tool": "Grep",
+                                "b": 9000, "a": 500}) + "\n")
+        out = os.path.join(tmp, "bt.html")
+        r = run(["--data-dir", tmp, "--db", os.path.join(tmp, "none.db"),
+                 "--projects", os.path.join(tmp, "noproj"), "--out", out, "--no-prune"])
+        check("退出码 0（不再崩溃）", r.returncode == 0, r.stderr[-200:])
+        check("报告已生成", os.path.exists(out))
+        check("越界时间戳计入损坏行（1 好 / 2 坏）",
+              "记账记录 1 条 / 损坏行 2" in r.stdout, r.stdout[-200:])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     print("report.py 冒烟测试")
     print("=" * 56)
@@ -309,6 +335,7 @@ def main():
     case_scan_full()
     case_serve()
     case_dashboard_ui()
+    case_bad_timestamp()
     print()
     print("通过 %d / 失败 %d" % (passed, failed))
     return 0 if failed == 0 else 1

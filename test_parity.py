@@ -12,6 +12,7 @@ wb-ops 一致性 + 性能对比测试
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -144,6 +145,39 @@ def build_cases():
     cases.append(("WebFetch 短输出（不裁）", "WebFetch",
                   "# Example Domain\n\nShort body text."))
 
+    # ---- v0.6.1 新增 ----
+    # 23. 退出码语义（X3）：bool 不当作退出码（不得出现 [exit code]）
+    cases.append(("Bash bool 退出码（不视为退出码）", "Bash",
+                  {"stdout": "\n".join("out %d" % i for i in range(200)), "exitCode": True}))
+
+    # 24. 退出码语义（X3）：整值 float（2.0）按 2 处理
+    cases.append(("Bash 整值 float 退出码", "Bash",
+                  {"stdout": "\n".join("out %d" % i for i in range(200)), "exitCode": 2.0}))
+
+    # 25. 退化输入（S9）：121 行空行 —— 输出不比原文小，应透传
+    cases.append(("121 行空行（越裁越大→透传）", "Grep", "\n" * 120))
+
+    # 26. S1：头段关键字行被预算挤出 —— 应被捞回，且不得谎称「未发现」
+    lh = ["L%03d %s" % (i, "x" * 180) for i in range(1, 201)]
+    lh[44] = "CRITICAL ERROR: database connection failed " + "y" * 160
+    cases.append(("头段关键字被挤出后捞回", "Grep", lh))
+
+    # 27. S1：尾段最早一行（被尾段填充挤出）的关键字行 —— 应被捞回
+    lt = ["T%03d %s" % (i, "x" * 190) for i in range(1, 201)]
+    lt[175] = "warning: tail squeeze " + "z" * 173
+    cases.append(("尾段关键字被挤出后捞回", "Grep", lt))
+
+    # 28. S1 文案：关键字全在显示区（第 3 行短行）—— 标记应说明「已包含在显示区域」
+    lc = ["short line %03d" % i for i in range(1, 201)]
+    lc[2] = "CRITICAL ERROR: boom"
+    cases.append(("关键字全在显示区（文案）", "Grep", lc))
+
+    # 29. S1 文案：预算截断（捞回 3 条 < 全文命中 4 条）—— 应补「共命中 4 条」
+    lb = ["L%03d %s" % (i, "x" * 245) for i in range(1, 201)]
+    for k, tag in ((44, "A"), (45, "B"), (46, "C"), (47, "D")):
+        lb[k] = "ERROR budget-cut %s " % tag + tag.lower() * 1100
+    cases.append(("预算截断：共命中提示", "Grep", lb))
+
     return cases
 
 
@@ -211,6 +245,11 @@ def test_stats_parity():
         with open(fs[0], encoding="utf-8") as f:
             return [ln for ln in f.read().splitlines() if ln.strip()]
 
+    def read_raw(d):
+        """二进制读取首份记账文件（S4：逐字节比对用，不做任何行尾归一化）。"""
+        fs = glob.glob(os.path.join(d, "saves-*.jsonl"))
+        return open(fs[0], "rb").read() if fs else b""
+
     d_ex = tempfile.mkdtemp(prefix="wbops-stats-ex-")
     d_py = tempfile.mkdtemp(prefix="wbops-stats-py-")
     r_ex = subprocess.run([EXE], input=payload, capture_output=True,
@@ -234,8 +273,38 @@ def test_stats_parity():
         checks.append(("a=裁剪后字节",
                        isinstance(trimmed, str) and o_ex["a"] == len(trimmed.encode("utf-8"))))
         checks.append(("t 是毫秒时间戳", isinstance(t_ex, int) and 10 ** 12 < t_ex < 10 ** 14))
+        # S4（v0.6.1）：二进制逐字节比对（含行尾）——此前文本模式读取恰好把 \r\n 归一化，测不出差异
+        b_ex, b_py = read_raw(d_ex), read_raw(d_py)
+        strip_t = lambda b: re.sub(rb'"t":\d+', b'"t":T', b)
+        checks.append(("记账行按二进制比对一致（仅 t 不同）",
+                       bool(b_ex) and strip_t(b_ex) == strip_t(b_py)))
+        checks.append(("记账行尾为 LF（两侧均无 \\r\\n）",
+                       b_ex.endswith(b"}\n") and b"\r" not in b_ex and b"\r" not in b_py))
     else:
         checks.append(("两侧都应产生记账文件", False))
+
+    # S4 附带（X2）：sid 含引号/反斜杠 —— JSON 转义后仍为合法 JSONL，双实现一致
+    payload2 = json.dumps({
+        "hook_event_name": "PostToolUse",
+        "session_id": 'ab"c\\d-12345678',
+        "tool_name": "Grep",
+        "tool_input": {},
+        "tool_response": raw_lines,
+    }, ensure_ascii=False).encode("utf-8")
+    d_ex2 = tempfile.mkdtemp(prefix="wbops-stats-ex2-")
+    d_py2 = tempfile.mkdtemp(prefix="wbops-stats-py2-")
+    subprocess.run([EXE], input=payload2, capture_output=True,
+                   env=dict(os.environ, WB_OPS_STATS_DIR=d_ex2))
+    subprocess.run([PYTHON, PY_SCRIPT], input=payload2, capture_output=True,
+                   env=dict(os.environ, WB_OPS_STATS_DIR=d_py2))
+    b_ex2, b_py2 = read_raw(d_ex2), read_raw(d_py2)
+    checks.append(("特殊 sid：双实现记账行一致（t 除外）",
+                   bool(b_ex2) and strip_t(b_ex2) == strip_t(b_py2)))
+    try:
+        ok_special = json.loads(b_ex2.decode("utf-8"))["s"] == 'ab"c\\d-1'
+    except Exception:
+        ok_special = False
+    checks.append(("特殊 sid：仍是合法 JSONL 且按 8 字节截断", ok_special))
 
     # 开关：WB_OPS_STATS=0 不写
     d_off = tempfile.mkdtemp(prefix="wbops-stats-off-")
@@ -273,7 +342,7 @@ def test_stats_parity():
         print("  %s  %s" % ("OK  " if ok else "FAIL", name))
         if not ok:
             fails += 1
-    for d in (d_ex, d_py, d_off, d_no, d_short, d_pre):
+    for d in (d_ex, d_py, d_ex2, d_py2, d_off, d_no, d_short, d_pre):
         shutil.rmtree(d, ignore_errors=True)
     return fails
 
@@ -332,6 +401,41 @@ def test_budget_env():
     checks.append(("上界收敛两侧一致（超位数）",
                    run_env([EXE], {"WB_OPS_BUDGET": "99999999999"}) ==
                    run_env([PYTHON, PY_SCRIPT], {"WB_OPS_BUDGET": "99999999999"})))
+
+    for name, ok in checks:
+        print("  %s  %s" % ("OK  " if ok else "FAIL", name))
+    return sum(1 for _, ok in checks if not ok)
+
+
+def test_io_chain():
+    """v0.6.1 输入链专项：BOM（S5）/ 孤立代理项（S3）。"""
+    print()
+    print("=" * 72)
+    print("v0.6.1 输入链测试（BOM / 孤立代理项）")
+    print("=" * 72)
+
+    checks = []
+    big = "\n".join("line %03d %s" % (i, "z" * 40) for i in range(1, 301))
+    payload = make_payload("Grep", big)
+
+    # S5：带 UTF-8 BOM 的输入 —— 双实现均应裁剪且逐字节一致（此前 py 侧透传）
+    bom = b"\xef\xbb\xbf" + payload
+    n_py = normalize(run([PYTHON, PY_SCRIPT], bom))
+    n_ex = normalize(run([EXE], bom))
+    checks.append(("BOM 输入：双实现均裁剪且一致",
+                   isinstance(n_py, str) and n_py == n_ex))
+
+    # S3：孤立代理项（合法 JSON 转义载荷）—— 不得崩溃；输出结构合法即可（不追字节 parity）
+    obj = {"hook_event_name": "PostToolUse", "tool_name": "Grep", "session_id": "s3",
+           "tool_response": "\ud800\n" * 300}
+    raw = json.dumps(obj, ensure_ascii=True).encode("ascii")
+    p_py = subprocess.run([PYTHON, PY_SCRIPT], input=raw, capture_output=True, env=ENV_NO_STATS)
+    checks.append(("代理项输入：py 返回码 0（不崩溃）", p_py.returncode == 0))
+    u = normalize(p_py.stdout)
+    checks.append(("代理项输入：py 输出结构合法（透传或裁剪均可）",
+                   u is None or isinstance(u, str)))
+    p_ex = subprocess.run([EXE], input=raw, capture_output=True, env=ENV_NO_STATS)
+    checks.append(("代理项输入：exe 返回码 0（不崩溃）", p_ex.returncode == 0))
 
     for name, ok in checks:
         print("  %s  %s" % ("OK  " if ok else "FAIL", name))
@@ -415,6 +519,31 @@ def main():
             if name == "关键字超 40 均匀抽样" and not ("err-0050" in n_ex and "err-2950" in n_ex):
                 assert_fail += 1
                 print("        !! 关键字超限抽样未覆盖全局")
+            # ---- v0.6.1 新增断言 ----
+            if name == "头段关键字被挤出后捞回" and not (
+                    "database connection failed" in n_ex and "未发现" not in n_ex):
+                assert_fail += 1
+                print("        !! 头段关键字未捞回，或标记仍谎称未发现")
+            if name == "尾段关键字被挤出后捞回" and "warning: tail squeeze" not in n_ex:
+                assert_fail += 1
+                print("        !! 尾段关键字未捞回")
+            if name == "关键字全在显示区（文案）" and not (
+                    "关键字行已包含在显示区域" in n_ex and "未发现" not in n_ex):
+                assert_fail += 1
+                print("        !! 显示区文案不正确")
+            if name == "预算截断：共命中提示" and "共命中 4 条" not in n_ex:
+                assert_fail += 1
+                print("        !! 未给出「共命中 M 条」的预算截断提示")
+            if name == "Bash bool 退出码（不视为退出码）" and "[exit code" in n_ex:
+                assert_fail += 1
+                print("        !! bool 被误当作退出码")
+            if name == "Bash 整值 float 退出码" and "[exit code 2]" not in n_ex:
+                assert_fail += 1
+                print("        !! 整值 float 退出码未被带上")
+        else:
+            if name == "121 行空行（越裁越大→透传）" and n_ex is not None:
+                assert_fail += 1
+                print("        !! 越裁越大时未透传")
 
     print()
     print("一致：%d / %d    不一致：%d" % (passed, len(cases), failed))
@@ -426,6 +555,9 @@ def main():
 
     # ---- v0.3.5 预算专项 ----
     budget_fail = test_budget_env()
+
+    # ---- v0.6.1 输入链专项 ----
+    io_fail = test_io_chain()
 
     # ---- 性能对比 ----
     print()
@@ -493,7 +625,7 @@ def main():
 
     print()
     return 0 if (failed == 0 and assert_fail == 0 and stats_fail == 0 and
-                 budget_fail == 0) else 1
+                 budget_fail == 0 and io_fail == 0) else 1
 
 
 if __name__ == "__main__":

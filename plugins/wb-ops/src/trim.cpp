@@ -6,16 +6,21 @@
 // 安全原则（与 Python 版一致）：
 //   1. 认不出来就原样透传 —— 绝不猜测、绝不破坏结构化输出
 //   2. 输出不长就不动 —— 而不是无脑截断
-//   3. 被丢掉的行里，命中 error/warning 等关键词的会捞回来
+//   3. 被丢掉的行里，命中 error/warning 等关键词的会捞回来（含头/尾段被预算挤掉的）
 //   4. 任何异常都静默退出（不输出 = 宿主保持原样），绝不让 hook 挂住会话
 //
 // 输入：stdin 收到 JSON，含 hook_event_name / tool_name / tool_input / tool_response
 // 输出：stdout 写 JSON，用 hookSpecificOutput.updatedToolOutput 替换工具结果
 //
+// v0.6.1：捞回域扩展至头/尾被挤行 + 标记文案按实际命中措辞（S1）；stdin 读取时即设
+// 8MB 上限（X1）；记账 sid/tool 走 JSON 转义、sid 按字节截断（S4/X2）；退出码数值
+// 先做 isfinite + 范围判断再转整型（X3/X5）；退化输入不比原文小就透传（S9）。
+//
 // 编译（MSYS2 MinGW-w64）：
 //   export PATH="/d/tool/msys64/mingw64/bin:$PATH"
 //   g++ -O2 -s -static -static-libgcc -static-libstdc++ -o bin/wb-ops-trim.exe src/trim.cpp
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,6 +53,8 @@ static const int MARKER_RESERVE = 300; // 给省略标记预留的字节数
 // ---- v0.3.5：预算可配置（WB_OPS_BUDGET，单位字节）----
 static const int BUDGET_MIN = 2000;    // 允许的最小预算（再窄内容只剩骨架）
 static const int BUDGET_CAP = 131072;  // 允许的最大预算（再大等于放弃裁剪）
+static const size_t MAX_INPUT = 8 * 1024 * 1024;  // v0.6.1：stdin 读取上限（读取时即生效）
+static const int MAX_FILL_ROUNDS = 4;  // v0.6.1（S1）：捞回候选迭代填充轮数上限（与 trim.py 一致）
 
 // 解析 WB_OPS_BUDGET，得到本次裁剪的字节预算；默认 MAX_BYTES。
 // 纯 ASCII 数字（与 hooks/trim.py 的 resolve_budget 完全一致，parity 有专项用例）：
@@ -158,9 +165,14 @@ static void trace(const std::string &msg) {
 // 落点：%USERPROFILE%\.workbuddy\wb-ops-data\saves-YYYYMM.jsonl
 //   （WB_OPS_STATS_DIR 覆盖数据目录；WB_OPS_STATS=0 整关）
 // 行格式与 hooks/trim.py 的 stats() 逐字节对齐（时间戳除外）：
-//   {"t":毫秒,"s":会话id前8位,"tool":"Grep","b":原始字节,"a":裁剪后字节}
+//   {"t":毫秒,"s":会话id前8字节,"tool":"Grep","b":原始字节,"a":裁剪后字节}
 // 只记尺寸与时间，不落任何输出内容。
+// v0.6.1（S4/X2）：sid/tool 经 dump_str JSON 转义（含引号/反斜杠也不产出非法 JSONL）；
+// sid 按 UTF-8 字节安全截到前 8 字节（与 Python 侧 u8_prefix 一致，不切断多字节字符）。
 // ---------------------------------------------------------------------------
+static std::string u8_prefix(const std::string &s, size_t n);   // 前置声明（定义见下方）
+static void dump_str(const std::string &s, std::string &out);   // 前置声明（定义见下方）
+
 static void ensure_dirs(const std::string &path) {
     for (size_t i = 1; i <= path.size(); i++) {
         if (i == path.size() || path[i] == '\\' || path[i] == '/') {
@@ -194,11 +206,13 @@ static void stats(const std::string &tool, const std::string &sid,
         std::string path = base + "\\saves-" + month + ".jsonl";
         FILE *f = fopen(path.c_str(), "ab");
         if (!f) return;
-        std::string sid8 = sid.size() > 8 ? sid.substr(0, 8) : sid;
-        std::string line = "{\"t\":" + std::to_string(now_ms) +
-                           ",\"s\":\"" + sid8 + "\",\"tool\":\"" + tool +
-                           "\",\"b\":" + std::to_string(before) +
-                           ",\"a\":" + std::to_string(after) + "}\n";
+        std::string sid8 = u8_prefix(sid, 8);   // 按字节截断（X2，与 Python 侧一致）
+        std::string line = "{\"t\":" + std::to_string(now_ms) + ",\"s\":";
+        dump_str(sid8, line);                   // JSON 转义（S4）
+        line += ",\"tool\":";
+        dump_str(tool, line);                   // JSON 转义（S4）
+        line += ",\"b\":" + std::to_string(before) +
+                ",\"a\":" + std::to_string(after) + "}\n";
         fwrite(line.data(), 1, line.size(), f);
         fclose(f);
     } catch (...) {
@@ -532,16 +546,21 @@ static bool extract_text(const JVal *resp, std::string &out) {
             out += parts[k];
         }
 
-        // 把非零退出码带上，避免丢失信息
+        // 把非零退出码带上，避免丢失信息。
+        // v0.6.1（X3/X5）：先判 isfinite + long long 范围再转整型（NaN/inf/越界不转，杜绝 UB），
+        // 且只认整数值（与 Python 侧「非 bool 的整数值且非 0」语义对齐）。
         const JVal *code = resp->get("exitCode");
         if (!code) code = resp->get("exit_code");
         if (code && code->t == JVal::NUM) {
-            long long ic = (long long)code->num;
-            if ((double)ic == code->num && ic != 0) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "[exit code %lld]", ic);
-                out += '\n';
-                out += buf;
+            double dn = code->num;
+            if (std::isfinite(dn) && dn >= -9223372036854775808.0 && dn < 9223372036854775808.0) {
+                long long ic = (long long)dn;
+                if ((double)ic == dn && ic != 0) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "[exit code %lld]", ic);
+                    out += '\n';
+                    out += buf;
+                }
             }
         }
         return true;
@@ -556,6 +575,13 @@ static bool extract_text(const JVal *resp, std::string &out) {
 // 输出结构：开头行 → [省略标记] → 捞回的关键行 → [末尾标记] → 结尾行
 // 预算按字节计：整体 MAX_BYTES，扣掉标记预留后按段使用；
 // 关键字段与结尾段各有保底额度，前面的段用不完的额度留给后面的段。
+//
+// v0.6.1（S1）：捞回候选 = 中段全部命中行 + 头/尾段「未被本段填中」的命中行
+// （保持原文顺序）；候选集依赖上一轮填充的省略集，故迭代填充至候选稳定
+// （上限 MAX_FILL_ROUNDS 轮；与 trim.py 使用相同循环，保 parity）。
+// 标记三态（与 trim.py 逐字节一致）：捞回非空 → “以下为捞回的 K 条关键字行”
+// （K < 全文命中数时补“共命中 M 条”）；全文无关键字 → “未发现…”；
+// 有关键字但全在显示区 → “关键字行已包含在显示区域”。
 // ---------------------------------------------------------------------------
 static bool trim_text(const std::string &text, std::string &out) {
     std::vector<std::string> lines;
@@ -589,37 +615,76 @@ static bool trim_text(const std::string &text, std::string &out) {
         return true;
     }
 
-    // ---- 选行：开头 / 结尾按行数取，中间只捞关键字行（超上限则均匀抽样）----
+    // ---- 选行：开头 / 结尾按行数取；捞回候选迭代填充至稳定（S1）----
     std::vector<std::string> head(lines.begin(), lines.begin() + HEAD_LINES);
     std::vector<std::string> tail(lines.end() - TAIL_LINES, lines.end());
+    const size_t mid_lo = (size_t)HEAD_LINES;
+    const size_t mid_hi = total - (size_t)TAIL_LINES;
 
-    std::vector<std::string> hits;
-    for (size_t k = HEAD_LINES; k < total - TAIL_LINES; k++) {
-        if (is_key_line(lines[k])) hits.push_back(lines[k]);
-    }
-    std::vector<std::string> key;
-    bool sampled = false;
-    if ((int)hits.size() > MAX_KEY_LINES) {
-        sampled = true;
-        size_t step = (hits.size() + MAX_KEY_LINES - 1) / MAX_KEY_LINES;  // 向上取整
-        for (size_t k = 0; k < hits.size(); k += step) key.push_back(hits[k]);
-    } else {
-        key = hits;
+    // 命中统计（全文一次预计算，供候选集与标记文案复用）
+    std::vector<char> is_key(total, 0);
+    size_t hit_total = 0;
+    for (size_t i = 0; i < total; i++) {
+        if (is_key_line(lines[i])) {
+            is_key[i] = 1;
+            hit_total++;
+        }
     }
 
-    // ---- 填预算 ----
+    // 初始候选：中段全部命中行（原捞回域）
+    std::vector<size_t> key_idx;
+    for (size_t i = mid_lo; i < mid_hi; i++) {
+        if (is_key[i]) key_idx.push_back(i);
+    }
+
     const size_t budget = budget_bytes - (size_t)MARKER_RESERVE;
-    size_t used = 0;
-    std::vector<std::string> head_shown = fill_lines(head, budget * 40 / 100, used);
-    std::vector<std::string> key_shown = fill_lines(key, budget * 70 / 100, used);
-    std::vector<std::string> tail_rev = fill_lines(
-        std::vector<std::string>(tail.rbegin(), tail.rend()), budget, used);
-    std::vector<std::string> tail_shown(tail_rev.rbegin(), tail_rev.rend());
+    std::vector<std::string> head_shown, key_shown, tail_shown;
+    std::vector<size_t> cand;
+    bool sampled = false;
+    size_t pool_n = 0;
+    for (int round = 0; round < MAX_FILL_ROUNDS; round++) {
+        // 候选超过捞出上限时按固定步长均匀抽样（覆盖全局，而非只看前 40 条）
+        pool_n = key_idx.size();
+        sampled = pool_n > (size_t)MAX_KEY_LINES;
+        cand.clear();
+        if (sampled) {
+            size_t step = (pool_n + (size_t)MAX_KEY_LINES - 1) / (size_t)MAX_KEY_LINES;  // 向上取整
+            for (size_t k = 0; k < pool_n; k += step) cand.push_back(key_idx[k]);
+        } else {
+            cand = key_idx;
+        }
+
+        // ---- 填预算 ----
+        size_t used = 0;
+        head_shown = fill_lines(head, budget * 40 / 100, used);
+        std::vector<std::string> key_lines;
+        key_lines.reserve(cand.size());
+        for (size_t k = 0; k < cand.size(); k++) key_lines.push_back(lines[cand[k]]);
+        key_shown = fill_lines(key_lines, budget * 70 / 100, used);
+        std::vector<std::string> tail_rev = fill_lines(
+            std::vector<std::string>(tail.rbegin(), tail.rend()), budget, used);
+        tail_shown = std::vector<std::string>(tail_rev.rbegin(), tail_rev.rend());
+
+        // 本轮的显示行索引集合
+        std::vector<char> shown(total, 0);
+        for (size_t k = 0; k < head_shown.size(); k++) shown[k] = 1;
+        for (size_t k = 0; k < key_shown.size() && k < cand.size(); k++) shown[cand[k]] = 1;
+        for (size_t k = 0; k < tail_shown.size(); k++) shown[total - 1 - k] = 1;
+
+        // 新一轮候选：中段全部命中行 + 头/尾段「未被本段填中」的命中行（原文顺序）
+        std::vector<size_t> new_idx;
+        for (size_t i = 0; i < total; i++) {
+            if (!is_key[i]) continue;
+            if ((i >= mid_lo && i < mid_hi) || !shown[i]) new_idx.push_back(i);
+        }
+        if (new_idx == key_idx) break;   // 候选已稳定：本轮填充即最终结果
+        key_idx.swap(new_idx);
+    }
 
     // ---- 组装（与 trim.py 逐字节一致）----
-    const long long shown = (long long)head_shown.size() + (long long)key_shown.size() +
-                            (long long)tail_shown.size();
-    const long long silent = (long long)total - shown;
+    const long long shown_n = (long long)head_shown.size() + (long long)key_shown.size() +
+                              (long long)tail_shown.size();
+    const long long silent = (long long)total - shown_n;
 
     std::vector<std::string> parts(head_shown);
     char mbuf[256];
@@ -627,19 +692,26 @@ static bool trim_text(const std::string &text, std::string &out) {
         if (sampled) {
             snprintf(mbuf, sizeof(mbuf),
                      "… [wb-ops 省略 %lld 行，命中关键字的 %d 条中均匀抽取 %d 条如下] …",
-                     silent, (int)hits.size(), (int)key_shown.size());
+                     silent, (int)pool_n, (int)key_shown.size());
+            parts.push_back(mbuf);
         } else {
             snprintf(mbuf, sizeof(mbuf),
-                     "… [wb-ops 省略 %lld 行，以下为捞回的 %d 条关键字行] …",
+                     "… [wb-ops 省略 %lld 行，以下为捞回的 %d 条关键字行",
                      silent, (int)key_shown.size());
+            std::string marker = mbuf;
+            if (key_shown.size() < hit_total) {
+                snprintf(mbuf, sizeof(mbuf), "（共命中 %d 条）", (int)hit_total);
+                marker += mbuf;
+            }
+            parts.push_back(marker + "] …");
         }
-        parts.push_back(mbuf);
-    } else if (hits.empty()) {
+    } else if (hit_total) {
         snprintf(mbuf, sizeof(mbuf),
-                 "… [wb-ops 省略 %lld 行，未发现 error/warning 关键字] …", silent);
+                 "… [wb-ops 省略 %lld 行（关键字行已包含在显示区域）] …", silent);
         parts.push_back(mbuf);
     } else {
-        snprintf(mbuf, sizeof(mbuf), "… [wb-ops 省略 %lld 行] …", silent);
+        snprintf(mbuf, sizeof(mbuf),
+                 "… [wb-ops 省略 %lld 行，未发现 error/warning 关键字] …", silent);
         parts.push_back(mbuf);
     }
     parts.insert(parts.end(), key_shown.begin(), key_shown.end());
@@ -655,6 +727,9 @@ static bool trim_text(const std::string &text, std::string &out) {
         if (k) res += '\n';
         res += parts[k];
     }
+
+    // v0.6.1（S9）：退化输入（如大量空行）可能越裁越大 —— 不比原文小就直接透传
+    if (res.size() >= text.size()) return false;
 
     // 兜底硬上界（正常不会触发）
     if (res.size() > budget_bytes)
@@ -745,13 +820,16 @@ int main() {
     {
         char buf[65536];
         size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) raw.append(buf, n);
+        while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) {
+            raw.append(buf, n);
+            // v0.6.1（X1）：读取时即设上限（宿主一般远小于此），超限直接透传
+            if (raw.size() > MAX_INPUT) {
+                trace("输入超过 8MB，直接透传");
+                return 0;
+            }
+        }
     }
     if (raw.empty()) return 0;
-    if (raw.size() > 8 * 1024 * 1024) {  // 防极端大输入占用内存（宿主一般远小于此）
-        trace("输入超过 8MB，直接透传");
-        return 0;
-    }
 
     // 去掉可能的前导 BOM
     if (raw.size() >= 3 && (unsigned char)raw[0] == 0xEF &&

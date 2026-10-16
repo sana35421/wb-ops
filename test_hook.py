@@ -6,8 +6,8 @@ wb-ops / 裁剪 hook 的自测
 把模拟的 PostToolUse 输入喂给 trim.py，检查三种情况：
     1. 大输出          -> 应该被裁剪，且中间的关键行被保留
     2. 小输出          -> 应该原样透传（hook 不输出任何东西）
-    3. 畸形输入        -> 应该静默透传，不能崩
-另检查记忆守卫（v0.3.6 起，SessionStart hook）：
+    3. 畸形输入        -> 应该静默透传，不能崩（含孤立代理项容错，v0.6.1）
+另检查记忆守卫（v0.3.6 起，SessionStart hook；v0.6.1 起用例自包含：临时 HOME + 自建记忆夹具）：
     4. 正常阈值静默 / 超限自动压缩指令 / 非法阈值回退 / remind 模式 / 非法模式回退
 另检查上下文守卫（v0.3.8 起 v1 / v0.6.0 起 v2，UserPromptSubmit hook）：
     5. 基础：超线注入 / 同档节流 / 小上下文静默 / 内部延续静默 / 非法阈值回退 / 关闭开关 / 事件注册（四事件）
@@ -52,8 +52,13 @@ def find_node():
     return None
 
 
-def run_guard(limit=None, mode=None):
-    """跑记忆守卫脚本，返回 (stdout, 返回码)。limit/mode 覆盖对应环境变量。"""
+def run_guard(limit=None, mode=None, home=None):
+    """跑记忆守卫脚本，返回 (stdout, 返回码)。limit/mode/home 覆盖对应环境变量。
+
+    home（v0.6.1/T1）：注入 USERPROFILE/HOME —— 守卫经 os.homedir() 定位
+    ~/.workbuddy/user-*-personal/MEMORY.md，注入后用例即可完全自包含，
+    不再依赖本机真实记忆文件是否存在。
+    """
     node = find_node()
     env = dict(os.environ)
     if limit is None:
@@ -64,6 +69,9 @@ def run_guard(limit=None, mode=None):
         env.pop("WB_OPS_MEM_GUARD_MODE", None)
     else:
         env["WB_OPS_MEM_GUARD_MODE"] = str(mode)
+    if home:
+        env["USERPROFILE"] = home   # Node os.homedir() 在 Windows 优先读 USERPROFILE
+        env["HOME"] = home          # 非 Windows 平台的回退变量
     proc = subprocess.run(
         [node, GUARD], input="{}", capture_output=True, text=True, encoding="utf-8", env=env
     )
@@ -180,58 +188,90 @@ def main():
             ok = False
         print("[3] %-18s %s" % (label, status))
 
-    # ---- 用例 4：记忆守卫（v0.3.6 起，SessionStart hook）----
+    # 3f（v0.6.1/S3）：孤立代理项（合法 JSON 转义）不得崩溃；
+    # 允许裁剪或透传，但返回码必须为 0、有输出则结构合法。
+    raw_sur = json.dumps({
+        "hook_event_name": "PostToolUse", "tool_name": "Grep",
+        "session_id": "s3-surrogate", "tool_response": "\ud800\n" * 300,
+    }, ensure_ascii=True).encode("ascii")
+    proc = subprocess.run([sys.executable, HOOK], input=raw_sur, capture_output=True)
+    o = proc.stdout.strip()
+    good = proc.returncode == 0
+    if good and o:
+        try:
+            json.loads(o.decode("utf-8"))
+        except Exception:
+            good = False
+    status = "PASS" if good else "FAIL"
+    if status == "FAIL":
+        ok = False
+    print("[3] %-18s %s" % ("孤立代理项容错", status))
+
+    # ---- 用例 4：记忆守卫（v0.3.6 起，SessionStart hook；v0.6.1 起用例自包含）----
     if not find_node():
         print("[4] 记忆守卫           SKIP（未找到 node）")
     else:
-        # 4a: 正常阈值 -> 静默（当前记忆文件应远小于默认阈值 3500）
-        out, code = run_guard()
-        status = "PASS" if code == 0 and out == "" else "FAIL"
-        if status == "FAIL":
-            ok = False
-        print("[4a] 正常阈值静默       %s" % status)
-
-        # 4b: 强触发阈值 -> 注入合法 JSON（默认 auto：含"自动"压缩指令）
-        out, code = run_guard(limit=50)
+        # 自包含夹具（T1）：在临时 HOME 下构造 ~/.workbuddy/user-test-personal/MEMORY.md
+        # （约 260 字符：>50 可触发 limit=50，<3500 对默认阈值静默），注入 USERPROFILE/HOME 运行。
+        mem_home = tempfile.mkdtemp(prefix="wb-ops-mem-")
         try:
-            d = json.loads(out)
-            h = d["hookSpecificOutput"]
-            good = (code == 0 and h["hookEventName"] == "SessionStart"
-                    and "MEMORY.md" in h["additionalContext"]
-                    and "自动" in h["additionalContext"])
-        except Exception:
-            good = False
-        status = "PASS" if good else "FAIL"
-        if status == "FAIL":
-            ok = False
-        print("[4b] 超限自动压缩指令   %s" % status)
+            mem_dir = os.path.join(mem_home, ".workbuddy", "user-test-personal")
+            os.makedirs(mem_dir)
+            fixture = ("# 记忆守卫测试夹具\n"
+                       + "- 守卫用例自包含：固定内容填充行，不依赖本机真实记忆文件。\n" * 8)
+            with open(os.path.join(mem_dir, "MEMORY.md"), "w", encoding="utf-8") as f:
+                f.write(fixture)
 
-        # 4c: 非法阈值 -> 回退默认（当前文件小于默认阈值，应静默）
-        out, code = run_guard(limit="abc")
-        status = "PASS" if code == 0 and out == "" else "FAIL"
-        if status == "FAIL":
-            ok = False
-        print("[4c] 非法阈值回退       %s" % status)
+            # 4a: 默认阈值（3500）-> 夹具未超限 -> 静默
+            out, code = run_guard(home=mem_home)
+            status = "PASS" if code == 0 and out == "" else "FAIL"
+            if status == "FAIL":
+                ok = False
+            print("[4a] 正常阈值静默       %s" % status)
 
-        # 4d: remind 模式 -> 建议式提醒（不含"自动执行"）
-        out, code = run_guard(limit=50, mode="remind")
-        try:
-            d = json.loads(out)
-            ctx = d["hookSpecificOutput"]["additionalContext"]
-            good = code == 0 and "建议" in ctx and "自动执行" not in ctx
-        except Exception:
-            good = False
-        status = "PASS" if good else "FAIL"
-        if status == "FAIL":
-            ok = False
-        print("[4d] remind 模式提醒     %s" % status)
+            # 4b: 强触发阈值 -> 注入合法 JSON（默认 auto：含"自动"压缩指令）
+            out, code = run_guard(limit=50, home=mem_home)
+            try:
+                d = json.loads(out)
+                h = d["hookSpecificOutput"]
+                good = (code == 0 and h["hookEventName"] == "SessionStart"
+                        and "MEMORY.md" in h["additionalContext"]
+                        and "自动" in h["additionalContext"])
+            except Exception:
+                good = False
+            status = "PASS" if good else "FAIL"
+            if status == "FAIL":
+                ok = False
+            print("[4b] 超限自动压缩指令   %s" % status)
 
-        # 4e: 非法模式 -> 回退 auto
-        out, code = run_guard(limit=50, mode="weird")
-        status = "PASS" if code == 0 and "自动执行" in out else "FAIL"
-        if status == "FAIL":
-            ok = False
-        print("[4e] 非法模式回退 auto   %s" % status)
+            # 4c: 非法阈值 -> 回退默认（夹具未超限，应静默）
+            out, code = run_guard(limit="abc", home=mem_home)
+            status = "PASS" if code == 0 and out == "" else "FAIL"
+            if status == "FAIL":
+                ok = False
+            print("[4c] 非法阈值回退       %s" % status)
+
+            # 4d: remind 模式 -> 建议式提醒（不含"自动执行"）
+            out, code = run_guard(limit=50, mode="remind", home=mem_home)
+            try:
+                d = json.loads(out)
+                ctx = d["hookSpecificOutput"]["additionalContext"]
+                good = code == 0 and "建议" in ctx and "自动执行" not in ctx
+            except Exception:
+                good = False
+            status = "PASS" if good else "FAIL"
+            if status == "FAIL":
+                ok = False
+            print("[4d] remind 模式提醒     %s" % status)
+
+            # 4e: 非法模式 -> 回退 auto
+            out, code = run_guard(limit=50, mode="weird", home=mem_home)
+            status = "PASS" if code == 0 and "自动执行" in out else "FAIL"
+            if status == "FAIL":
+                ok = False
+            print("[4e] 非法模式回退 auto   %s" % status)
+        finally:
+            shutil.rmtree(mem_home, ignore_errors=True)
 
     # ---- 用例 5：上下文守卫（v0.3.8 起，UserPromptSubmit hook）----
     if not find_node():

@@ -13,7 +13,7 @@ WorkBuddy 通过三个注册表文件管理插件，本脚本按它们的实际�
 用法：
     python install_wb_ops.py            安装
     python install_wb_ops.py sync       只把插件目录（plugins/wb-ops）内容同步进市场副本 + 安装快照（日常改代码后用）
-    python install_wb_ops.py uninstall  卸载（恢复备份并删除市场目录）
+    python install_wb_ops.py uninstall  卸载（按字段移除注册条目；只删本插件目录与版本快照）
     python install_wb_ops.py status     查看当前状态
     python install_wb_ops.py gc         清理旧版本安装快照（默认只预演，加 --yes 执行）
 
@@ -34,7 +34,7 @@ PLUGINS = os.path.join(WB, "plugins")
 MARKETPLACE = "local"   # 市场名；可用 --marketplace NAME 覆盖
 PLUGIN = "wb-ops"
 PLUGIN_ID = "%s@%s" % (PLUGIN, MARKETPLACE)
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 BACKUP_SUFFIX = ".bak-2026-10-15-wbops"
 
 MARKET_DIR = os.path.join(PLUGINS, "marketplaces", MARKETPLACE)
@@ -275,41 +275,52 @@ def uninstall():
     print("卸载 %s ..." % PLUGIN_ID)
     print()
 
-    for path, name in ((KNOWN, "known_marketplaces.json"),
-                       (INSTALLED, "installed_plugins.json"),
-                       (SETTINGS, "settings.json")):
-        bak = path + BACKUP_SUFFIX
-        if os.path.exists(bak):
-            shutil.copy2(bak, path)
-            print("  已还原 %s" % name)
-        else:
-            print("  跳过 %s（无备份）" % name)
+    # v0.6.1（T3）：优先「按字段删除」——只移除本插件在注册表中的条目。
+    # 旧的「整份还原备份」会把用户在安装 wb-ops 之后新增的插件注册一起回滚，
+    # 故降级为：单文件字段删除失败时才对该文件回退整份还原。
+    targets = (
+        (KNOWN, "known_marketplaces.json", MARKETPLACE,
+         lambda d: d.pop(MARKETPLACE, None)),
+        (INSTALLED, "installed_plugins.json", PLUGIN_ID,
+         lambda d: d.get("plugins", {}).pop(PLUGIN_ID, None)),
+        (SETTINGS, "settings.json", PLUGIN_ID,
+         lambda d: d.get("enabledPlugins", {}).pop(PLUGIN_ID, None)),
+    )
+    for path, name, entry_name, drop in targets:
+        if not os.path.exists(path):
+            print("  跳过 %s（文件不存在）" % name)
+            continue
+        try:
+            d = read_json(path)
+            if drop(d) is None:
+                print("  %s 无本插件条目（无需变更）" % name)
+                continue
+            write_json(path, d, backup=False)
+            print("  已从 %s 移除 %s" % (name, entry_name))
+        except Exception as exc:
+            bak = path + BACKUP_SUFFIX
+            if os.path.exists(bak):
+                shutil.copy2(bak, path)
+                print("  字段删除失败（%s），已回退为整份还原 %s" % (exc, name))
+            else:
+                print("  跳过 %s（字段删除失败：%s；且无备份可还原）" % (name, exc))
 
-    # 兜底：万一没有备份，就按字段逐个删除
-    try:
-        km = read_json(KNOWN)
-        if km.pop(MARKETPLACE, None) is not None:
-            write_json(KNOWN, km, backup=False)
-            print("  已从 known_marketplaces 移除 %s" % MARKETPLACE)
-        ip = read_json(INSTALLED)
-        if ip.get("plugins", {}).pop(PLUGIN_ID, None) is not None:
-            write_json(INSTALLED, ip, backup=False)
-            print("  已从 installed_plugins 移除 %s" % PLUGIN_ID)
-        st = read_json(SETTINGS)
-        if st.get("enabledPlugins", {}).pop(PLUGIN_ID, None) is not None:
-            write_json(SETTINGS, st, backup=False)
-            print("  已从 enabledPlugins 移除 %s" % PLUGIN_ID)
-    except Exception as exc:
-        print("  字段清理跳过：%s" % exc)
-
-    if os.path.isdir(MARKET_DIR):
-        shutil.rmtree(MARKET_DIR)
-        print("  已删除市场目录 %s" % MARKET_DIR)
-
-    cache_root = os.path.join(PLUGINS, "cache", MARKETPLACE)
-    if os.path.isdir(cache_root):
-        shutil.rmtree(cache_root)
-        print("  已删除安装快照 %s" % cache_root)
+    # v0.6.1（T4）：只删本插件目录与版本快照；
+    # 市场目录 / cache 市场目录仅在其为空时清理（同一市场名下可能还有其它插件）。
+    if os.path.isdir(PLUGIN_DIR):
+        shutil.rmtree(PLUGIN_DIR)
+        print("  已删除插件目录 %s" % PLUGIN_DIR)
+    cache_plugin = os.path.join(PLUGINS, "cache", MARKETPLACE, PLUGIN)
+    if os.path.isdir(cache_plugin):
+        shutil.rmtree(cache_plugin)
+        print("  已删除安装快照 %s" % cache_plugin)
+    for empty_dir in (os.path.join(MARKET_DIR, "plugins"), MARKET_DIR,
+                      os.path.join(PLUGINS, "cache", MARKETPLACE)):
+        try:
+            os.rmdir(empty_dir)   # 仅当为空时才会成功
+            print("  已清理空目录 %s" % empty_dir)
+        except OSError:
+            pass
 
     print()
     print("卸载完成。重启 WorkBuddy 后生效。")
@@ -402,23 +413,39 @@ def gc(apply=False):
 
 
 def apply_marketplace(argv):
-    """支持 --marketplace NAME：重算相关全局路径（须在任何安装逻辑之前调用）。"""
+    """支持 --marketplace NAME：重算相关全局路径（须在任何安装逻辑之前调用）。
+
+    v0.6.1（T2）：返回剥离 `--marketplace NAME` 参数对之后的位置参数列表，
+    供入口按「首个非 - 开头 token」取子命令 —— 此前只看 argv[1]，
+    `python install_wb_ops.py --marketplace X status` 会被误当作 install 实际执行。
+    """
     global MARKETPLACE, PLUGIN_ID, MARKET_DIR, PLUGIN_DIR, CACHE_DIR
-    if "--marketplace" in argv:
-        i = argv.index("--marketplace")
-        if i + 1 >= len(argv):
-            print("! --marketplace 需要一个名字，例如 --marketplace local")
-            sys.exit(2)
-        MARKETPLACE = argv[i + 1]
-        PLUGIN_ID = "%s@%s" % (PLUGIN, MARKETPLACE)
-        MARKET_DIR = os.path.join(PLUGINS, "marketplaces", MARKETPLACE)
-        PLUGIN_DIR = os.path.join(MARKET_DIR, "plugins", PLUGIN)
-        CACHE_DIR = os.path.join(PLUGINS, "cache", MARKETPLACE, PLUGIN, VERSION)
+    rest = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--marketplace":
+            if i + 1 >= len(argv):
+                print("! --marketplace 需要一个名字，例如 --marketplace local")
+                sys.exit(2)
+            MARKETPLACE = argv[i + 1]
+            i += 2
+            continue
+        rest.append(argv[i])
+        i += 1
+    PLUGIN_ID = "%s@%s" % (PLUGIN, MARKETPLACE)
+    MARKET_DIR = os.path.join(PLUGINS, "marketplaces", MARKETPLACE)
+    PLUGIN_DIR = os.path.join(MARKET_DIR, "plugins", PLUGIN)
+    CACHE_DIR = os.path.join(PLUGINS, "cache", MARKETPLACE, PLUGIN, VERSION)
+    return rest
 
 
 if __name__ == "__main__":
-    apply_marketplace(sys.argv[1:])
-    cmd = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else "install"
+    rest = apply_marketplace(sys.argv[1:])
+    cmd = next((a for a in rest if not a.startswith("-")), "install")
+    unknown = [a for a in rest if a.startswith("-") and a != "--yes"]
+    if unknown:
+        print("未知参数：%s（可用：--marketplace NAME / --yes）" % " ".join(unknown))
+        sys.exit(2)
     if cmd == "install":
         sys.exit(install())
     if cmd == "sync":
@@ -428,6 +455,6 @@ if __name__ == "__main__":
     if cmd == "status":
         sys.exit(status())
     if cmd == "gc":
-        sys.exit(gc("--yes" in sys.argv))
+        sys.exit(gc("--yes" in rest))
     print("未知命令：%s（可用：install / sync / uninstall / status / gc）" % cmd)
     sys.exit(2)

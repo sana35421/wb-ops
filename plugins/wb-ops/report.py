@@ -3,7 +3,8 @@
 """wb-ops 节省统计与 Token 使用报告（v0.3.x 后台；命令行入口 /wb-ops:report）
 
 读取三类数据。默认生成单文件 dashboard.html；`--serve` 启动本地实时服务，浏览器每次访问
-都现场重算（数据即扫即新，页面自动刷新），日常查看无需反复生成。内联样式与 SVG，零依赖：
+都现场重算（数据即扫即新；5 秒内的并发请求共享同一份结果，页面自动刷新），日常查看无需反复生成。
+内联样式与 SVG，零依赖：
   1. ~/.workbuddy/wb-ops-data/saves-*.jsonl  —— wb-ops 裁剪记账（省了多少，决定性数据）
   2. ~/.workbuddy/workbuddy.db（只读）        —— 会话积分消耗 / 上下文占用窗口
   3. ~/.workbuddy/projects/*/*.jsonl          —— 单遍全量直读 transcript（v0.3.5 起一次遍历产出）：
@@ -136,6 +137,10 @@ def load_saves(data_dir):
                         if not (isinstance(t, (int, float)) and isinstance(b, (int, float))
                                 and isinstance(a, (int, float))):
                             raise ValueError("bad field type")
+                        # v0.6.1（S2）：时间戳区间校验（(0, 4102444800000) ≈ 公元 2100 年前），
+                        # 越界值（半行/脏数据/手工改坏）计入 bad 丢弃，而不是把整份报告拖崩
+                        if not (0 < t < 4102444800000):
+                            raise ValueError("timestamp out of range")
                         records.append({"t": int(t), "s": str(o.get("s", "")),
                                         "tool": str(o.get("tool", "")),
                                         "b": int(b), "a": int(a)})
@@ -147,8 +152,12 @@ def load_saves(data_dir):
 
 
 def load_host(db_path):
-    """只读读取 workbuddy.db：sessions + session_usage。读失败返回空结构（降级）。"""
-    out = {"sessions": [], "usage": [], "ok": False, "err": ""}
+    """只读读取 workbuddy.db：sessions + session_usage。读失败返回空结构（降级）。
+
+    v0.6.1（S7）：credit_json 解析失败逐条计数（credit_bad），供页面区分
+    「本就没有积分数据」与「读库/解析失败导致的降级」。
+    """
+    out = {"sessions": [], "usage": [], "ok": False, "err": "", "credit_bad": 0}
     if not os.path.exists(db_path):
         out["err"] = "数据库不存在"
         return out
@@ -168,12 +177,13 @@ def load_host(db_path):
             credits = {}
             try:
                 cj = json.loads(r[4]) if r[4] else {}
-                if isinstance(cj, dict):
-                    for k, v in cj.items():
-                        if isinstance(v, (int, float)):
-                            credits[str(k)] = float(v)
+                if not isinstance(cj, dict):
+                    raise ValueError("credit_json 不是对象")
+                for k, v in cj.items():
+                    if isinstance(v, (int, float)):
+                        credits[str(k)] = float(v)
             except Exception:
-                pass
+                out["credit_bad"] += 1   # 解析失败计数（S7）：页面据此提示降级
             out["usage"].append({
                 "sid": r[0] or "", "used": int(r[1] or 0), "size": int(r[2] or 0),
                 "updated_at": int(r[3] or 0), "credits": credits,
@@ -287,7 +297,7 @@ def aggregate(records, host, rid_ts, models=None, ctx=None):
         "today_saved": 0, "week_saved": 0,
         "per_day": {d.isoformat(): 0 for d in days},
         "per_day_cnt": {d.isoformat(): 0 for d in days},
-        "per_tool": {}, "per_project": {}, "per_session": {},
+        "per_tool": {}, "per_project": {},
         "recent": [], "models": models or {},
     }
     for r in records:
@@ -301,7 +311,8 @@ def aggregate(records, host, rid_ts, models=None, ctx=None):
             agg["per_day_cnt"][ds] += 1
         if ds == today.isoformat():
             agg["today_saved"] += saved
-        if ds >= monday.isoformat():
+        # v0.6.1（S6）：加当天上界，未来时间戳（时钟偏移/脏数据）不再虚增本周节省
+        if monday.isoformat() <= ds <= today.isoformat():
             agg["week_saved"] += saved
         tl = agg["per_tool"].setdefault(r["tool"], {"saved": 0, "cnt": 0, "b": 0, "a": 0})
         tl["saved"] += saved
@@ -313,11 +324,6 @@ def aggregate(records, host, rid_ts, models=None, ctx=None):
         pl = agg["per_project"].setdefault(proj, {"saved": 0, "cnt": 0})
         pl["saved"] += saved
         pl["cnt"] += 1
-        sl = agg["per_session"].setdefault(r["s"], {"saved": 0, "cnt": 0,
-                                                    "title": (ses["title"] if ses else "") or ("会话 " + r["s"][:6] if r["s"] else "未知"),
-                                                    "cwd": ses["cwd"] if ses else ""})
-        sl["saved"] += saved
-        sl["cnt"] += 1
         agg["recent"].append(r)
 
     agg["recent"] = sorted(agg["recent"], key=lambda r: r["t"], reverse=True)[:RECENT_ROWS]
@@ -853,6 +859,15 @@ def render_html(agg, meta):
       % ('本地服务将每 %d 秒整页刷新。' % refresh if served and refresh else '此页面不会自动刷新。'))
     if meta.get("demo"):
         A("<div class='banner'>示意报告：以下为全合成演示数据，仅预览版式，不代表真实使用情况。</div>")
+    else:
+        # v0.6.1（S7）：宿主数据降级时给出明确提示（区分「无数据」与「读库/解析失败」）
+        if meta.get("host_ok") is False:
+            A("<div class='banner'>宿主数据库读取失败（%s）：积分与上下文区已降级为空显示。"
+              "可检查 workbuddy.db 是否存在/是否被占用后重新生成。</div>"
+              % esc(meta.get("host_err") or "未知原因"))
+        if meta.get("credit_bad"):
+            A("<div class='banner'>%d 条会话积分记录解析失败，相关积分按 0 显示（数据仍保留在宿主库中）。</div>"
+              % int(meta["credit_bad"]))
     A('<p class="search-note" id="search-count" role="status" aria-live="polite">搜索仅筛选表格，不改变统计口径</p>')
 
     # ---- 概览卡：默认输出完整数值，无脚本也可读 ----
@@ -1168,6 +1183,10 @@ def build(args, live_refresh=0, served=False):
         "bad": bad,
         "live_refresh": live_refresh,
         "served": served or live_refresh > 0,
+        # v0.6.1（S7）：宿主降级信息进 meta —— 页面可区分「无数据」与「读库失败」
+        "host_ok": host.get("ok"),
+        "host_err": host.get("err") or "",
+        "credit_bad": host.get("credit_bad", 0),
     })
     info = {
         "data_dir": data_dir, "out_path": out_path, "note": note,
@@ -1248,7 +1267,10 @@ def serve(args):
             try:
                 body = get_html().encode("utf-8")
             except Exception as e:
-                self.send_error(500, "report build failed: %s" % e)
+                # v0.6.1（S8）：状态行固定 ASCII —— send_error 的状态行不经清洗且以 latin-1
+                # 严格编码，异常原文含换行/中文会污染响应头甚至二次抛错；详情只写 stderr。
+                sys.stderr.write("构建失败：%r\n" % (e,))
+                self.send_error(500, "report build failed")
                 return
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
