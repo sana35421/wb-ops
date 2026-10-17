@@ -45,6 +45,38 @@ BUDGET_CAP = 131072     # 允许的最大预算（再大等于放弃裁剪）
 MAX_INPUT = 8 * 1024 * 1024   # v0.6.1：stdin 读取上限（读取时即生效，超限透传）
 MAX_FILL_ROUNDS = 4     # v0.6.1（S1）：捞回候选迭代填充轮数上限（双实现一致，保 parity）
 
+# ---- v0.6.9：Read 按需裁剪（默认关闭）----
+READ_MIN_LINES = 1500   # Read 小于这么多行一律不裁（源码要完整读）
+READ_HEAD_LINES = 200   # Read 头段行数
+READ_TAIL_LINES = 120   # Read 尾段行数
+
+# Read 模式下的「符号行」：函数 / 类 / 结构 / 导入等骨架行
+# （全是字面量，用子串匹配，与 src/trim.cpp 的 SYMBOLS 逐项一致，保 parity）
+SYMBOLS = ("#include", "function ", "def ", "class ", "struct ", "namespace ",
+           "impl ", "interface ", "pub fn", "export ", "typedef ", "import ")
+
+
+def is_symbol_line(line):
+    return any(sym in line for sym in SYMBOLS)
+
+
+def env_flag(name):
+    """环境变量取 "1"（容忍两侧空白），与 src/trim.cpp 的 env_flag 一致"""
+    return (os.environ.get(name) or "").strip(" \t\r\n\v\f") == "1"
+
+
+def bash_failed(text):
+    """Bash 失败透传：宿主给 Bash 的是纯文本「… / Exit Code: N / Signal: …」，
+    命令失败时整段输出都可能有用，不裁剪。只认文本里的 "Exit Code: N"；
+    结构化对象（带 exitCode 字段）仍按原逻辑裁剪并补退出码。
+    """
+    key = "Exit Code:"
+    p = text.rfind(key)
+    if p < 0:
+        return False
+    m = re.match(r"[ \t]*(-?[0-9]+)", text[p + len(key):p + len(key) + 24])
+    return bool(m) and int(m.group(1)) != 0
+
 
 def resolve_budget():
     """解析 WB_OPS_BUDGET 环境变量，得到本次裁剪的字节预算；默认 MAX_BYTES。
@@ -224,7 +256,7 @@ def fill_lines(cands, cap, used):
     return chosen, used
 
 
-def trim(text):
+def trim(text, read_mode=False):
     """返回裁剪后的文本；如果不需要裁剪则返回 None。
 
     输出结构：开头行 → [省略标记] → 捞回的关键行 → [末尾标记] → 结尾行
@@ -234,18 +266,24 @@ def trim(text):
     v0.6.1（S1）：捞回候选 = 中段全部命中行 + 头/尾段「未被本段填中」的命中行
     （保持原文顺序）。候选集依赖上一轮填充的省略集，故迭代填充至候选稳定
     （上限 MAX_FILL_ROUNDS 轮；两实现使用相同循环，保 parity）。
-    标记三态：捞回非空 → “以下为捞回的 K 条关键字行”（K < 全文命中数时补“共命中 M 条”）；
-    全文无关键字 → “未发现…”；有关键字但全在显示区 → “关键字行已包含在显示区域”。
+    v0.6.9：标记带行号区间（供模型 offset 定向回查）；read_mode 时按「头 + 尾 + 符号行」
+    处理源码，并用符号行措辞。
     """
     lines = text.split("\n")
     total = len(lines)
     tbytes = blen(text)
     budget_bytes = resolve_budget()   # v0.3.5：可用 WB_OPS_BUDGET 覆盖（默认 8000）
+    head_n = READ_HEAD_LINES if read_mode else HEAD_LINES
+    tail_n = READ_TAIL_LINES if read_mode else TAIL_LINES
 
-    if total <= MAX_LINES and tbytes <= budget_bytes:
+    # 触发条件：普通工具「行数 > 120 或字节 > 预算」；Read 只认长文件（行数 > 1500 且字节超预算）
+    if not read_mode:
+        if total <= MAX_LINES and tbytes <= budget_bytes:
+            return None
+    elif total <= READ_MIN_LINES or tbytes <= budget_bytes:
         return None
 
-    if total <= HEAD_LINES + TAIL_LINES + 5:
+    if total <= head_n + tail_n + 5:
         # 行数少但字节多（超长单行），按字节截首尾（额度随预算等比缩放；默认 8000 -> 5000/2400）
         lh = budget_bytes * 5 // 8
         lt = budget_bytes * 3 // 10
@@ -254,12 +292,14 @@ def trim(text):
         return "%s\n… [wb-ops 省略 %d 字节] …\n%s" % (
             head, tbytes - blen(head) - blen(tail), tail)
 
-    head = lines[:HEAD_LINES]
-    tail = lines[total - TAIL_LINES:]
-    mid_lo, mid_hi = HEAD_LINES, total - TAIL_LINES
+    head = lines[:head_n]
+    tail = lines[total - tail_n:]
+    mid_lo, mid_hi = head_n, total - tail_n
 
     # 命中统计（全文一次预计算，供候选集与标记文案复用）
-    is_key = [bool(KEY_PATTERN.search(line)) for line in lines]
+    # 普通模式认 error/warning 等关键字；Read 模式认函数/类/import 等符号行
+    hit = is_symbol_line if read_mode else (lambda ln: bool(KEY_PATTERN.search(ln)))
+    is_key = [bool(hit(line)) for line in lines]
     hit_total = sum(is_key)   # 全文命中总数 M（标记文案用）
 
     # 初始候选：中段全部命中行（原捞回域）
@@ -305,24 +345,36 @@ def trim(text):
     shown_count = len(head_shown) + len(key_shown) + len(tail_shown)
     silent = total - shown_count
 
+    # v0.6.9：未显示区间的首末行号（1 基），写进标记供模型 offset 定向回查
+    omitted_idx = [i for i in range(total) if i not in shown]
+    rng_lo = omitted_idx[0] + 1 if omitted_idx else 0
+    rng_hi = omitted_idx[-1] + 1 if omitted_idx else 0
+
+    key_word = "符号行" if read_mode else "关键字行"
     parts = list(head_shown)
     if key_shown:
         if sampled:
-            parts.append("… [wb-ops 省略 %d 行，命中关键字的 %d 条中均匀抽取 %d 条如下] …"
-                         % (silent, pool_n, len(key_shown)))
+            parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行），%s的 %d 条中均匀抽取 %d 条如下] …"
+                         % (silent, rng_lo, rng_hi,
+                            "命中符号" if read_mode else "命中关键字",
+                            pool_n, len(key_shown)))
         else:
-            marker = ("… [wb-ops 省略 %d 行，以下为捞回的 %d 条关键字行"
-                      % (silent, len(key_shown)))
+            marker = ("… [wb-ops 省略 %d 行（第 %d–%d 行），以下为捞回的 %d 条%s"
+                      % (silent, rng_lo, rng_hi, len(key_shown), key_word))
             if len(key_shown) < hit_total:
                 marker += "（共命中 %d 条）" % hit_total
-            parts.append(marker + "] …")
+            parts.append(marker + ("，可加 offset 回查] …" if read_mode else "] …"))
     elif hit_total:
-        parts.append("… [wb-ops 省略 %d 行（关键字行已包含在显示区域）] …" % silent)
+        parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行，%s已包含在显示区域）] …"
+                     % (silent, rng_lo, rng_hi, key_word))
     else:
-        parts.append("… [wb-ops 省略 %d 行，未发现 error/warning 关键字] …" % silent)
+        parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行，未发现 %s）] …"
+                     % (silent, rng_lo, rng_hi,
+                        "函数/类/import 行" if read_mode else "error/warning 关键字"))
     parts.extend(key_shown)
     if tail_shown:
-        parts.append("… [wb-ops 以下为原文末尾 %d 行] …" % len(tail_shown))
+        parts.append("… [wb-ops 以下为原文末尾 %d 行（第 %d–%d 行）] …"
+                     % (len(tail_shown), total - len(tail_shown) + 1, total))
         parts.extend(tail_shown)
 
     res = "\n".join(parts)
@@ -398,7 +450,15 @@ def main():
         pass
 
     try:
-        trimmed = trim(text)
+        tool = data.get("tool_name")
+        read_mode = tool == "Read" and env_flag("WB_OPS_READ_TRIM")
+        if tool == "Read" and not read_mode:
+            trace("Read 未开启按需裁剪（WB_OPS_READ_TRIM!=1），透传")
+            return
+        if tool == "Bash" and bash_failed(text):
+            trace("Bash 退出码非 0，保留完整输出，透传")
+            return
+        trimmed = trim(text, read_mode)
     except Exception as e:   # 兜底：裁剪出任何意外都静默透传，绝不让 hook 挂住会话
         trace("裁剪异常，透传：%r" % (e,))
         return

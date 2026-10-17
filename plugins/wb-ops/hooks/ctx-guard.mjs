@@ -29,6 +29,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const STEP_DEFAULT = 40000;
 const FALLBACK_LIGHT = 130000;   // T 未知时的轻档线
@@ -52,11 +53,40 @@ const LIGHT_OVERRIDE = /^\d+$/.test(guardEnv) && parseInt(guardEnv, 10) > 0
     ? parseInt(guardEnv, 10) : 0;
 const STEP = parsePositive(process.env.WB_OPS_CTX_GUARD_STEP, STEP_DEFAULT);
 const POST_MAX = parsePositive(process.env.WB_OPS_POST_COMPACT_MAX, POST_MAX_DEFAULT);
+/**
+ * 宿主根探测（v0.6.5）
+ *
+ * 本机并存两套宿主，配置根互不相通：WorkBuddy → ~/.workbuddy，WorkBuddyAI → ~/.workbuddy-ai，
+ * 产品配置（模型表 / 上下文窗口）与 settings 各存一份。原实现硬编码 ~/.workbuddy，
+ * 在新宿主下会读到另一套宿主那份可能过期的模型表 → 查表落空 → 退到 130K/170K 兜底，
+ * 守卫不会失效，但水线精度下降。这里改为按当前宿主解析。
+ *
+ * 顺序：WB_OPS_HOST_HOME 显式指定 → 从脚本自身位置推导（快照形如 <HOST>/plugins/cache/…）
+ *      → 默认 ~/.workbuddy。开发目录下直接运行时走默认，与历史行为一致。
+ */
+const HOST_HOME = (() => {
+    const explicit = (process.env.WB_OPS_HOST_HOME || '').trim();
+    if (explicit) return explicit;
+    try {
+        const segs = path.dirname(fileURLToPath(import.meta.url)).split(path.sep);
+        const idx = segs.lastIndexOf('plugins');
+        if (idx > 0) {
+            const cand = segs.slice(0, idx).join(path.sep);
+            if (fs.statSync(path.join(cand, 'plugins')).isDirectory()) return cand;
+        }
+    } catch {
+        /* 开发目录 / 路径异常：回退默认 */
+    }
+    return path.join(os.homedir(), '.workbuddy');
+})();
+
+// 状态目录刻意保持共用一份（不随宿主变化）：两个宿主的会话前缀互不冲突，
+// 共用可避免切换宿主时节流状态丢失、同档重复提醒。记账同理由 trim 侧固定。
 const STATE_DIR = process.env.WB_OPS_CTX_GUARD_DIR ||
     path.join(os.homedir(), '.workbuddy', 'wb-ops-data');
 const STATE_FILE = path.join(STATE_DIR, 'ctx-guard.json');
-const SETTINGS_FILE = path.join(os.homedir(), '.workbuddy', 'settings.json');
-const PRODUCT_CFG_FILE = path.join(os.homedir(), '.workbuddy', 'cache', 'acc-product-config-v3.json');
+const SETTINGS_FILE = path.join(HOST_HOME, 'settings.json');
+const PRODUCT_CFG_FILE = path.join(HOST_HOME, 'cache', 'acc-product-config-v3.json');
 
 /** 同步读取 stdin 全部内容（hook 协议：宿主把 JSON 写在 stdin） */
 function readStdin() {

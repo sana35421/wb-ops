@@ -178,6 +178,35 @@ def build_cases():
         lb[k] = "ERROR budget-cut %s " % tag + tag.lower() * 1100
     cases.append(("预算截断：共命中提示", "Grep", lb))
 
+    # ---- v0.6.9 新增 ----
+    # 30. Bash 成功（宿主真实形状：tool_response 是纯字符串，末尾带 Exit Code: 0）—— 应裁剪
+    bash_ok = "Command: pytest -q\nStdout: " + \
+        "\n".join("test_%03d PASSED" % i for i in range(600)) + \
+        "\nStderr: \nExit Code: 0\nSignal: (none)"
+    cases.append(("Bash 字符串 Exit Code 0（裁剪）", "Bash", bash_ok))
+
+    # 31. Bash 失败（Exit Code: 1）—— 报错现场必须完整保留，透传
+    bash_bad = "Command: g++ a.cpp\nStdout: " + \
+        "\n".join("cc1plus: note %d" % i for i in range(600)) + \
+        "\nStderr: a.cpp:3: error: x was not declared\nExit Code: 1\nSignal: (none)"
+    cases.append(("Bash 字符串 Exit Code 1（透传）", "Bash", bash_bad))
+
+    # 32. Read 默认关闭 —— 长文件也原样透传（受 WB_OPS_READ_TRIM 控制）
+    read_text = "\n".join("    body_line_%d = compute(x) + 1" % i for i in range(2000))
+    cases.append(("Read 默认关闭（透传）", "Read", read_text))
+
+    # 33. Read 开启：>1500 行才生效，保留首尾 + 符号行
+    rd = []
+    for i in range(2000):
+        rd.append("def func_%d(x):" % i if i % 300 == 0 else "    body_%d = compute(x)" % i)
+    cases.append(("Read 开启（符号行捞回）", "Read", "\n".join(rd),
+                  {"WB_OPS_READ_TRIM": "1"}))
+
+    # 34. 行号区间标记：省略段起止行号应可读（第 X–Y 行）
+    rng = ["line %d: ok" % i for i in range(400)]
+    rng[200] = "ERROR: boom"
+    cases.append(("省略标记含行号区间", "Grep", rng))
+
     return cases
 
 
@@ -457,15 +486,18 @@ def main():
     assert_fail = 0
     ratios = []
 
-    for name, tool, resp in cases:
+    for case in cases:
+        name, tool, resp = case[0], case[1], case[2]
+        extra_env = case[3] if len(case) > 3 else {}
         event = "PostToolUse"
         payload = make_payload(tool, resp, event)
         # 事件名测试用例需要特殊处理
         if "事件名不对" in name:
             payload = make_payload(tool, resp, "PreToolUse")
+        env = dict(ENV_NO_STATS, **extra_env)
 
-        r_py = run([PYTHON, PY_SCRIPT], payload)
-        r_ex = run([EXE], payload)
+        r_py = run([PYTHON, PY_SCRIPT], payload, env)
+        r_ex = run([EXE], payload, env)
         n_py = normalize(r_py)
         n_ex = normalize(r_ex)
 
@@ -540,10 +572,28 @@ def main():
             if name == "Bash 整值 float 退出码" and "[exit code 2]" not in n_ex:
                 assert_fail += 1
                 print("        !! 整值 float 退出码未被带上")
+            # ---- v0.6.9 新增断言 ----
+            if name == "Bash 字符串 Exit Code 0（裁剪）" and "wb-ops 省略" not in n_ex:
+                assert_fail += 1
+                print("        !! Bash 成功输出未被裁剪")
+            if name == "Read 开启（符号行捞回）" and not (
+                    "符号行" in n_ex and "def func_0" in n_ex and "offset" in n_ex):
+                assert_fail += 1
+                print("        !! Read 模式未保留符号行，或标记文案缺符号行/offset 提示")
+            if name == "省略标记含行号区间" and not re.search(r"第 \d+\u2013\d+ 行", n_ex):
+                assert_fail += 1
+                print("        !! 省略标记缺行号区间")
         else:
             if name == "121 行空行（越裁越大→透传）" and n_ex is not None:
                 assert_fail += 1
                 print("        !! 越裁越大时未透传")
+            # ---- v0.6.9 新增断言（应透传的用例）----
+            if name == "Bash 字符串 Exit Code 1（透传）" and n_ex is not None:
+                assert_fail += 1
+                print("        !! Bash 失败输出被裁剪，报错现场丢失")
+            if name == "Read 默认关闭（透传）" and n_ex is not None:
+                assert_fail += 1
+                print("        !! Read 未开启按需裁剪却改了输出")
 
     print()
     print("一致：%d / %d    不一致：%d" % (passed, len(cases), failed))

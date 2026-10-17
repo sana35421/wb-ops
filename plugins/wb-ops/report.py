@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """wb-ops 节省统计与 Token 使用报告（v0.3.x 后台；命令行入口 /wb-ops:report）
 
-读取三类数据。默认生成单文件 dashboard.html；`--serve` 启动本地实时服务，浏览器每次访问
-都现场重算（数据即扫即新；5 秒内的并发请求共享同一份结果，页面自动刷新），日常查看无需反复生成。
+读取三类数据。斜杠命令默认打开固定动态后台；Python 无参保留静态导出兼容。
+`--serve` 启动或复用本地实时服务（5 秒短缓存、页面自动刷新），日常查看无需反复生成。
 内联样式与 SVG，零依赖：
   1. ~/.workbuddy/wb-ops-data/saves-*.jsonl  —— wb-ops 裁剪记账（省了多少，决定性数据）
   2. ~/.workbuddy/workbuddy.db（只读）        —— 会话积分消耗 / 上下文占用窗口
@@ -406,15 +406,30 @@ def aggregate(records, host, rid_ts, models=None, ctx=None):
 # ---------------------------------------------------------------------------
 
 CSS = """
-:root { color-scheme:dark; --bg:#0b0d11; --surface:#12161c; --border:rgba(255,255,255,.085);
-  --text:#eef1f5; --muted:#99a3b2; --mint:#74e6bf; --blue:#8faedd; }
+:root { color-scheme:dark; --bg:#070a0e; --surface:#0e131b; --surface-subtle:#121824;
+  --border:rgba(174,203,227,.09); --border-hover:rgba(116,230,191,.35);
+  --text:#edf4fa; --text-strong:#ffffff; --muted:#8e9fae; --mint:#74e6bf; --blue:#9cbcf2; }
 * { box-sizing:border-box; }
 html { scroll-behavior:smooth; scroll-padding-top:92px; }
 body { margin:0; background:var(--bg); color:var(--text);
-  font:14px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif; }
-body::before { content:''; position:fixed; pointer-events:none; z-index:-1; top:-240px; right:0;
-  width:750px; height:650px; border-radius:50%; opacity:.065;
-  background:radial-gradient(ellipse,#74e6bf,transparent 66%); animation:ambient 22s ease-in-out infinite alternate; }
+  font:14px/1.65 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
+  letter-spacing:-.01em; -webkit-font-smoothing:antialiased; }
+body::before { content:''; position:fixed; pointer-events:none; z-index:-1; inset:0;
+  background:radial-gradient(ellipse 900px 500px at 85% -10%,rgba(116,230,191,.065),transparent 70%),
+             radial-gradient(ellipse 700px 400px at 15% 100%,rgba(156,188,242,.04),transparent 70%),
+             linear-gradient(rgba(255,255,255,.012) 1px,transparent 1px),
+             linear-gradient(90deg,rgba(255,255,255,.012) 1px,transparent 1px);
+  background-size:100% 100%,100% 100%,48px 48px,48px 48px; }
+.hero-accent { color:var(--mint); margin-left:4px; text-shadow:0 0 20px rgba(116,230,191,.35); }
+.card:first-child { background:linear-gradient(135deg,rgba(21,48,41,.92),rgba(14,24,28,.85) 60%,rgba(14,19,27,.8) 100%);
+  border-color:rgba(116,230,191,.28); box-shadow:0 6px 24px -6px rgba(0,0,0,.5),0 0 16px -4px rgba(116,230,191,.15); }
+.card:first-child:hover { border-color:rgba(116,230,191,.5); box-shadow:0 12px 32px -6px rgba(0,0,0,.6),0 0 24px -2px rgba(116,230,191,.25); }
+.panel h2 { display:flex; align-items:center; gap:10px; }
+.panel h2::before { content:''; width:3px; height:15px; border-radius:3px; background:var(--mint); opacity:.85;
+  box-shadow:0 0 8px rgba(116,230,191,.5); }
+.table-scroll { scrollbar-width:thin; scrollbar-color:rgba(116,230,191,.2) transparent; }
+.runtime-item strong { color:#dbeafa; }
+
 a { color:inherit; text-decoration:none; }
 button,input { font:inherit; }
 button { cursor:pointer; }
@@ -425,37 +440,41 @@ button:disabled { cursor:not-allowed; opacity:.55; }
   color:#0b0d11; transform:translateY(-160%); border-radius:6px; }
 .skip-link:focus { transform:none; }
 .sidebar { position:fixed; inset:0 auto 0 0; width:220px; padding:30px 16px 20px;
-  background:#0d1015; border-right:1px solid var(--border); display:flex; flex-direction:column; z-index:10; }
+  background:linear-gradient(180deg,#0a0f16,#070a0e); border-right:1px solid rgba(174,203,227,.07);
+  display:flex; flex-direction:column; z-index:10; }
 .brand { display:flex; align-items:center; gap:12px; padding:0 12px 32px; font-size:20px; font-weight:650; letter-spacing:-.6px; }
-.brand svg { color:var(--mint); flex:none; }
+.brand svg { color:var(--mint); flex:none; filter:drop-shadow(0 0 10px rgba(116,230,191,.4)); }
 .brand small { display:block; font-size:9px; color:var(--muted); letter-spacing:2px; font-weight:500; }
-.nav-label { color:#7e8998; font-size:10px; letter-spacing:1.7px; padding:6px 14px 12px; }
+.nav-label { color:#627282; font-size:10px; letter-spacing:1.7px; padding:6px 14px 12px; }
 .sidebar nav { display:grid; gap:7px; }
 .nav-link { display:flex; align-items:center; gap:12px; padding:11px 14px; border:1px solid transparent;
-  border-radius:7px; color:#a5afbd; font-size:13px; transition:background .2s,color .2s,border-color .2s; }
-.nav-icon { width:18px; color:#829082; font:11px/1.5 ui-monospace,Consolas,monospace; }
-.nav-link:hover { color:var(--text); background:#ffffff04; border-color:var(--border); }
-.nav-link[aria-current] { color:var(--mint); background:#74e6bf0a; border-color:#74e6bf19; }
+  border-radius:8px; color:#95a3b3; font-size:13px; font-weight:500;
+  transition:all .2s cubic-bezier(.16,1,.3,1); }
+.nav-icon { width:18px; color:#6b7c7b; font:11px/1.5 ui-monospace,Consolas,monospace; transition:color .2s; }
+.nav-link:hover { color:var(--text); background:rgba(255,255,255,.03); border-color:rgba(174,203,227,.12);
+  transform:translateX(2px); }
+.nav-link[aria-current] { color:var(--mint); background:linear-gradient(90deg,rgba(116,230,191,.09),rgba(116,230,191,.02));
+  border-color:rgba(116,230,191,.22); box-shadow:inset 2px 0 0 var(--mint); }
 .nav-link[aria-current] .nav-icon { color:var(--mint); }
 .privacy { margin-top:auto; padding:24px 12px 0; border-top:1px solid var(--border); color:var(--muted); font-size:11px; }
-.privacy strong { display:block; color:#b3c4bb; font-size:10px; letter-spacing:1.8px; margin-bottom:5px; }
+.privacy strong { display:block; color:#9cb1a4; font-size:10px; letter-spacing:1.8px; margin-bottom:5px; }
 .privacy svg { vertical-align:-2px; margin-right:5px; }
 .workspace { margin-left:220px; min-width:0; }
-.topbar { position:sticky; top:0; z-index:8; border-bottom:1px solid var(--border); background:#0b0d11f5; }
+.topbar { position:sticky; top:0; z-index:8; border-bottom:1px solid rgba(174,203,227,.07);
+  background:rgba(7,10,14,.78); backdrop-filter:blur(16px) saturate(180%); -webkit-backdrop-filter:blur(16px); }
 .topbar-inner { min-height:76px; max-width:1400px; margin:auto; padding:14px 40px;
   display:flex; align-items:center; gap:20px; flex-wrap:wrap; }
 .breadcrumb { font-size:12px; color:var(--muted); margin-right:auto; white-space:nowrap; }
-.breadcrumb span { margin:0 12px; color:#505a68; }
-.breadcrumb b { color:#dae1eb; font-weight:500; }
-.search { display:flex; align-items:center; gap:10px; width:245px; border:1px solid var(--border);
-  background:#ffffff03; padding:8px 11px; border-radius:7px; }
-.search:focus-within { border-color:#74e6bf66; }
-.search svg { color:var(--muted); flex:none; }
-.search input { width:100%; min-width:0; border:0; outline:none; color:var(--text); background:none; font-size:12px; }
-.search input::placeholder { color:#8993a3; }
-.refresh-button { display:inline-flex; align-items:center; gap:8px; background:#ffffff05; color:#d7dee8;
-  border:1px solid #ffffff18; border-radius:7px; padding:8px 12px; font-size:12px; transition:border-color .2s,background .2s; }
-.refresh-button:hover:not(:disabled) { border-color:#74e6bf55; background:#74e6bf09; }
+.breadcrumb span { margin:0 12px; color:#3b4754; }
+.breadcrumb b { color:#dae1eb; font-weight:550; }
+.refresh-countdown { color:var(--muted); font:11px/1.5 ui-monospace,Consolas,monospace; min-width:90px; text-align:right; }
+.refresh-button { display:inline-flex; align-items:center; gap:8px; background:rgba(255,255,255,.03); color:#d7dee8;
+  border:1px solid rgba(255,255,255,.1); border-radius:8px; padding:8px 14px; font-size:12px; font-weight:500;
+  box-shadow:0 1px 3px rgba(0,0,0,.3),inset 0 1px 0 rgba(255,255,255,.06);
+  transition:all .2s cubic-bezier(.16,1,.3,1); }
+.refresh-button:hover:not(:disabled) { border-color:rgba(116,230,191,.4); background:rgba(116,230,191,.08);
+  color:#fff; transform:translateY(-1px); box-shadow:0 4px 12px -2px rgba(116,230,191,.2); }
+.refresh-button:active:not(:disabled) { transform:translateY(0) scale(.98); }
 .refresh-button.is-loading svg { animation:spin 1s linear infinite; }
 .wrap { max-width:1400px; margin:0 auto; padding:44px 40px 54px; min-width:0; }
 .hero { display:flex; justify-content:space-between; align-items:flex-start; gap:24px; margin-bottom:30px; }
@@ -471,22 +490,42 @@ h2 { font-size:14px; margin:0 0 20px; font-weight:600; letter-spacing:.1px; }
 .status[data-state='error'] { color:#efb78c; }
 .status[data-state='error'] .status-dot { background:#efb78c; }
 .generation { display:block; margin-top:8px; color:#a5afbd; font:11px/1.8 ui-monospace,Consolas,monospace; }
-.search-note { color:var(--muted); font-size:11px; text-align:right; margin:-14px 0 14px; min-height:18px; }
+.runtime-strip { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1px; margin:0 0 30px;
+  background:rgba(174,203,227,.07); border:1px solid rgba(174,203,227,.1); border-radius:12px; overflow:hidden;
+  box-shadow:0 4px 20px -4px rgba(0,0,0,.4); }
+.runtime-item { padding:18px 22px; background:linear-gradient(180deg,#0f151e,#0b1017); min-width:0;
+  transition:background .2s; }
+.runtime-item:hover { background:linear-gradient(180deg,#121a24,#0d131c); }
+.runtime-item span { display:block; font-size:11px; color:var(--muted); margin-bottom:6px; font-weight:500; }
+.runtime-item strong { font-size:22px; font-weight:650; letter-spacing:-.5px; font-variant-numeric:tabular-nums; }
+.runtime-item small { display:block; margin-top:4px; color:var(--muted); font-size:10px; }
+.health-summary { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin:0 0 18px; }
+.health-summary .tag { margin:0; padding:4px 9px; }
 .metadata { margin:0 0 25px; color:var(--muted); font-size:12px; }
 summary { cursor:pointer; width:fit-content; }
-.metadata p { overflow-wrap:anywhere; padding:12px 16px; background:#ffffff03; border:1px solid var(--border); border-radius:8px; }
+.metadata p { overflow-wrap:anywhere; padding:12px 16px; background:rgba(255,255,255,.02);
+  border:1px solid var(--border); border-radius:8px; }
 .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; margin-bottom:24px; }
-.card,.panel { min-width:0; background:var(--surface); border:1px solid var(--border); border-radius:11px;
-  box-shadow:0 4px 16px #0000000c; animation:rise .6s both; transition:border-color .25s,box-shadow .25s; }
-.card:hover,.panel:hover { border-color:#ffffff29; box-shadow:0 8px 30px #00000019; }
+.card,.panel { min-width:0; background:linear-gradient(180deg,rgba(18,24,34,.7),rgba(14,19,27,.8));
+  border:1px solid rgba(174,203,227,.1); border-radius:12px;
+  box-shadow:0 4px 20px -2px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.05);
+  animation:rise .4s cubic-bezier(.16,1,.3,1) both;
+  transition:all .25s cubic-bezier(.16,1,.3,1); }
+.card:hover,.panel:hover { border-color:rgba(174,203,227,.24);
+  box-shadow:0 12px 32px -4px rgba(0,0,0,.5),0 0 16px -2px rgba(116,230,191,.08),inset 0 1px 0 rgba(255,255,255,.08);
+  transform:translateY(-2px); }
 .is-updated .card,.is-updated .panel,.is-updated .chart-line,.is-updated .chart-bar,.is-updated .bar i { animation:none; }
 .card { padding:21px 21px 15px; position:relative; overflow:hidden; }
+.card::before { content:''; position:absolute; top:0; left:15%; right:15%; height:1px;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.15),transparent); pointer-events:none; }
 .card:nth-child(2) { animation-delay:.07s; } .card:nth-child(3) { animation-delay:.14s; } .card:nth-child(4) { animation-delay:.21s; }
 .card-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-.card .k { color:#b0bac7; font-size:12px; }
-.kpi-icon { color:#91b4a5; border:1px solid #74e6bf21; background:#74e6bf05; border-radius:6px;
-  width:25px; height:25px; display:grid; place-items:center; font:10px ui-monospace,Consolas,monospace; }
-.card .v { margin:16px 0 4px; font-size:clamp(24px,2.4vw,32px); line-height:1.3; font-weight:600;
+.card .k { color:#9cb0c1; font-size:12px; font-weight:500; }
+.kpi-icon { color:#91b4a5; border:1px solid rgba(116,230,191,.2); background:rgba(116,230,191,.06); border-radius:7px;
+  width:26px; height:26px; display:grid; place-items:center; font:10px ui-monospace,Consolas,monospace;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.08); }
+.card .v { margin:16px 0 4px; font-size:clamp(24px,2.4vw,32px); line-height:1.3; font-weight:650;
+  letter-spacing:-1px; font-variant-numeric:tabular-nums; white-space:nowrap; }
   letter-spacing:-1px; font-variant-numeric:tabular-nums; white-space:nowrap; }
 .card-note { font-size:11px; color:var(--muted); min-height:20px; }
 .sparkline { display:block; width:100%; height:35px; margin-top:18px; color:var(--mint); opacity:.75; }
@@ -515,31 +554,34 @@ summary { cursor:pointer; width:fit-content; }
 .chart-line { stroke-dasharray:1600; stroke-dashoffset:0; animation:draw 1.3s ease both; }
 .table-scroll { width:100%; max-width:100%; overflow:auto; overscroll-behavior-x:contain; border-radius:5px; }
 table { width:100%; border-collapse:collapse; font-size:12px; }
-th { text-align:left; color:#9ca7b7; font-weight:500; font-size:11px; padding:11px 12px;
-  border-bottom:1px solid #ffffff0e; background:#ffffff02; white-space:nowrap; }
-td { padding:14px 12px; border-bottom:1px solid #ffffff07; vertical-align:middle; overflow-wrap:anywhere; min-width:88px; }
+th { text-align:left; color:#8ea0b2; font-weight:550; font-size:11px; padding:12px 14px;
+  border-bottom:1px solid rgba(255,255,255,.07); background:rgba(255,255,255,.015); white-space:nowrap; letter-spacing:.02em; }
+td { padding:14px; border-bottom:1px solid rgba(255,255,255,.04); vertical-align:middle; overflow-wrap:anywhere; min-width:88px; }
 td:first-child { min-width:140px; }
-tbody tr { transition:background .2s; }
-tbody tr:hover { background:#ffffff03; }
+tbody tr { transition:background .18s ease; }
+tbody tr:hover { background:rgba(255,255,255,.025); }
 tr:last-child td { border-bottom:none; }
 .num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; overflow-wrap:normal; }
-.bar { height:5px; background:#ffffff08; border-radius:4px; overflow:hidden; min-width:80px; }
-.bar i { display:block; height:100%; border-radius:4px; transform-origin:left; animation:grow .9s .15s both; }
+.bar { height:6px; background:rgba(255,255,255,.06); border-radius:6px; overflow:hidden; min-width:80px; box-shadow:inset 0 1px 2px rgba(0,0,0,.4); }
+.bar i { display:block; height:100%; border-radius:6px; transform-origin:left; animation:grow .9s .15s both;
+  box-shadow:0 0 6px rgba(116,230,191,.4); }
 .muted { color:var(--muted); }
 .green { color:var(--mint); } .blue { color:var(--blue); } .red { color:#ef9999; } .gold { color:#dfbd88; }
-.tag { display:inline-block; font-size:10px; padding:2px 7px; border-radius:5px; border:1px solid var(--border);
-  color:var(--muted); margin:3px 0 3px 6px; white-space:nowrap; }
-.tag.warn { color:#efb0a0; border-color:#efb0a030; background:#efb0a009; }
-.tag.ok { color:var(--mint); border-color:#74e6bf30; background:#74e6bf08; }
+.tag { display:inline-block; font-size:10px; font-weight:500; padding:2px 8px; border-radius:6px; border:1px solid var(--border);
+  color:var(--muted); margin:3px 0 3px 6px; white-space:nowrap; letter-spacing:.02em; }
+.tag.warn { color:#f0a897; border-color:rgba(240,168,151,.25); background:rgba(240,168,151,.08); box-shadow:0 0 8px -2px rgba(240,168,151,.2); }
+.tag.ok { color:var(--mint); border-color:rgba(116,230,191,.25); background:rgba(116,230,191,.08); box-shadow:0 0 8px -2px rgba(116,230,191,.2); }
 .empty { color:var(--muted); padding:34px 20px; margin:8px 0; text-align:center; font-size:12px;
   background:linear-gradient(120deg,#ffffff02,transparent); border:1px dashed #ffffff12; border-radius:8px; }
 .empty::before { content:'—'; display:block; margin-bottom:8px; color:#74958a; font-size:24px; }
-.foot { color:#97a2b2; font-size:11px; line-height:1.95; margin-top:30px; border-top:1px solid var(--border); padding-top:20px; }
-.foot b { color:#c5cedb; font-weight:500; }
-.banner { background:#dfbd8808; border:1px solid #dfbd8828; color:#dfbd88;
-  border-radius:8px; padding:10px 15px; font-size:12px; margin-bottom:24px; }
-.banner-tip { background:#74e6bf0d; border-color:#74e6bf2e; color:#74e6bf; }
-code { background:#ffffff06; border-radius:4px; padding:2px 6px; font-size:11px; color:#acc3e6; overflow-wrap:anywhere; }
+.foot { color:#8292a4; font-size:11px; line-height:1.95; margin-top:34px; border-top:1px solid var(--border); padding-top:22px; }
+.foot b { color:#c5cedb; font-weight:550; }
+.banner { background:rgba(223,189,136,.06); border:1px solid rgba(223,189,136,.22); color:#dfbd88;
+  border-radius:10px; padding:12px 18px; font-size:12px; margin-bottom:24px; backdrop-filter:blur(8px); }
+.banner-tip { background:rgba(116,230,191,.06); border-color:rgba(116,230,191,.25); color:var(--mint);
+  box-shadow:0 2px 12px -2px rgba(116,230,191,.12); }
+code { background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.08); border-radius:5px;
+  padding:2px 7px; font-size:11px; color:#bcd1ee; font-family:ui-monospace,Consolas,monospace; overflow-wrap:anywhere; }
 @keyframes rise { from { opacity:0; transform:translateY(12px); } to { opacity:1; transform:none; } }
 @keyframes grow { from { transform:scale(.02,.02); opacity:.1; } to { transform:scale(1,1); opacity:1; } }
 @keyframes draw { from { stroke-dashoffset:1600; } to { stroke-dashoffset:0; } }
@@ -549,7 +591,7 @@ code { background:#ffffff06; border-radius:4px; padding:2px 6px; font-size:11px;
 @media (min-width:1600px) { .wrap { padding-top:52px; } .card { padding:25px 25px 18px; } }
 @media (max-width:1200px) { .wrap { padding:32px 24px 48px; } .topbar-inner { padding:14px 24px; gap:14px; }
   .cards { grid-template-columns:repeat(2,minmax(0,1fr)); } .card .v { font-size:30px; }
-  .panel { padding:20px; } .grid2 { gap:16px; } .search { width:210px; } }
+  .panel { padding:20px; } .grid2 { gap:16px; } }
 @media (max-width:900px) { html { scroll-padding-top:164px; } .sidebar { position:relative; inset:auto; width:auto; padding:14px 20px 0; }
   .brand { padding:0 0 13px; font-size:18px; } .brand small { display:none; } .brand svg { width:26px; height:26px; }
   .nav-label,.privacy { display:none; } .sidebar nav { display:flex; gap:4px; overflow-x:auto; padding:0 0 12px; }
@@ -558,13 +600,13 @@ code { background:#ffffff06; border-radius:4px; padding:2px 6px; font-size:11px;
   .skip-link { left:16px; } .wrap { padding-top:32px; } .grid2 { grid-template-columns:1fr; }
   .panel { scroll-margin-top:90px; } .chart { max-height:270px; } }
 @media (max-width:600px) { .sidebar { padding:16px 16px 0; } .topbar-inner { padding:10px 16px; gap:10px; }
-  .breadcrumb { flex-basis:100%; font-size:11px; } .search { width:auto; flex:1; } .refresh-button { padding:8px 10px; }
+  .breadcrumb { flex-basis:100%; font-size:11px; } .refresh-countdown { margin-left:auto; } .refresh-button { padding:8px 10px; }
   .wrap { padding:28px 16px 36px; } .hero { display:block; margin-bottom:22px; } h1 { font-size:27px; }
   .hero-meta { margin-top:18px; text-align:left; } .generation { display:inline-block; margin:0 0 0 12px; }
   .cards { grid-template-columns:1fr; gap:12px; } .card { padding:20px; } .card .v { font-size:32px; }
   .sparkline { height:32px; margin-top:12px; } .panel { padding:18px 14px; }
   .chart-summary { flex-wrap:wrap; } h2 { font-size:13px; } .section-label { margin-top:26px; }
-  .metadata { font-size:11px; } .search-note { text-align:left; } }
+  .metadata { font-size:11px; } .runtime-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } .runtime-item { padding:15px; } }
 @media (prefers-reduced-motion:reduce) { html { scroll-behavior:auto !important; }
   *,*::before,*::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; } }
 """
@@ -574,7 +616,8 @@ JS = r"""
 (() => {
   'use strict';
   const body = document.body;
-  const input = document.getElementById('table-search');
+  const countdown = document.getElementById('refresh-countdown');
+  let nextRefreshAt = 0;
   const button = document.getElementById('refresh-button');
   const status = document.getElementById('refresh-status');
   const message = document.getElementById('refresh-message');
@@ -584,7 +627,6 @@ JS = r"""
   let controller = null;
   let busy = false;
   let failed = body.dataset.stale === 'true';
-  const rowText = new WeakMap();
 
   function setStatus(state, text) {
     status.dataset.state = state;
@@ -601,26 +643,11 @@ JS = r"""
       setStatus('live', interval ? '本地服务 · 每 ' + interval / 1000 + ' 秒更新' : '本地服务 · 仅手动更新');
     }
   }
-  function filter(root) {
-    const query = input.value.trim().toLocaleLowerCase();
-    let count = 0;
-    let total = 0;
-    root.querySelectorAll('.table-scroll').forEach(wrap => {
-      let visible = 0;
-      wrap.querySelectorAll('tbody tr').forEach(row => {
-        if (!rowText.has(row)) rowText.set(row, row.textContent.toLocaleLowerCase());
-        row.hidden = !!query && !rowText.get(row).includes(query);
-        total++;
-        if (!row.hidden) { visible++; count++; }
-      });
-      const empty = wrap.nextElementSibling;
-      if (empty && empty.classList.contains('search-empty')) empty.hidden = !query || visible > 0;
-    });
-    const note = document.getElementById('search-count');
-    note.textContent = query ? '表格匹配 ' + count + ' / ' + total + ' 行 · 图表与统计不变' : '搜索仅筛选表格，不改变统计口径';
+  function updateCountdown() {
+    countdown.textContent = nextRefreshAt && !document.hidden && !busy
+      ? '下次更新 ' + Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000)) + 's' : '';
   }
   function init(root) {
-    filter(root);
     root.querySelectorAll('.table-scroll').forEach((wrap, i) => {
       const title = wrap.closest('.panel').querySelector('h2');
       wrap.setAttribute('aria-label', (title ? title.textContent : '数据表 ' + (i + 1)) + '，可横向滚动');
@@ -628,7 +655,12 @@ JS = r"""
   }
   function schedule() {
     clearTimeout(timer);
-    if (live && interval && !document.hidden && !busy) timer = setTimeout(refresh, interval);
+    nextRefreshAt = 0;
+    if (live && interval && !document.hidden && !busy) {
+      nextRefreshAt = Date.now() + interval;
+      timer = setTimeout(refresh, interval);
+    }
+    updateCountdown();
   }
   function focusState(root) {
     const active = document.activeElement;
@@ -641,6 +673,8 @@ JS = r"""
     if (!live || busy) return;
     busy = true;
     clearTimeout(timer);
+    nextRefreshAt = 0;
+    updateCountdown();
     button.setAttribute('aria-disabled', 'true');
     button.classList.add('is-loading');
     button.setAttribute('aria-busy', 'true');
@@ -698,9 +732,6 @@ JS = r"""
       else link.removeAttribute('aria-current');
     });
   }
-  document.addEventListener('input', event => {
-    if (event.target === input) filter(document.getElementById('report-content'));
-  });
   document.addEventListener('click', event => {
     if (event.target.closest('#refresh-button')) refresh();
   });
@@ -710,10 +741,10 @@ JS = r"""
     if (!busy) restingStatus();
     schedule();
   });
-  window.addEventListener('pagehide', () => { clearTimeout(timer); if (controller) controller.abort(); });
-  window.addEventListener('pageshow', () => { restingStatus(); schedule(); });
+  window.addEventListener('pagehide', () => { clearTimeout(timer); clearInterval(countdownTimer); if (controller) controller.abort(); });
+  window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); else { restingStatus(); schedule(); } });
   window.addEventListener('hashchange', selectNav);
-  input.disabled = false;
+  const countdownTimer = live && interval ? setInterval(updateCountdown, 1000) : null;
   button.disabled = !live;
   button.title = live ? '读取当前本地服务的最新数据' : '这是静态快照；使用 --serve 可手动和自动更新';
   init(document.getElementById('report-content'));
@@ -842,27 +873,24 @@ def render_html(agg, meta):
         <div class="breadcrumb">Workspace<span>/</span><b>运行概览</b></div>''')
     A('<span id="refresh-status" class="status" data-state="%s" role="status" aria-live="polite">'
       '<i class="status-dot" aria-hidden="true"></i><span id="refresh-message">%s</span></span>' % (state, esc(mode)))
-    A('''<label class="search" for="table-search">
-        <svg width="15" height="15" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.4"/><path d="m13 13 4 4" stroke="currentColor" stroke-width="1.4"/></svg>
-        <input id="table-search" type="search" placeholder="搜索表格内容…" aria-label="搜索并筛选表格行" autocomplete="off" disabled>
-      </label><button class="refresh-button" id="refresh-button" type="button" disabled title="静态快照或 JavaScript 未启用时不可刷新">
+    A('''<span class="refresh-countdown" id="refresh-countdown" aria-hidden="true"></span>
+      <button class="refresh-button" id="refresh-button" type="button" disabled title="静态快照或 JavaScript 未启用时不可刷新">
         <svg width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M16 7a6.5 6.5 0 1 0 .3 5M16 2v5h-5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>手动刷新</button>
       </div></header><main class="wrap" id="report-content" tabindex="-1">
       <section class="hero" id="overview" aria-labelledby="overview-title"><div>
-        <p class="eyebrow">OPERATIONS / OVERVIEW</p><h1 id="overview-title">让每一次调用，更轻盈。</h1>
-        <p class="sub">wb-ops 节省与 Token 使用报告 · 观察裁剪效能与上下文健康。</p></div><div class="hero-meta">''')
+        <p class="eyebrow">WB-OPS / LOCAL OBSERVABILITY</p><h1 id="overview-title">运行总览<span class="hero-accent">.</span></h1>
+        <p class="sub">节省有迹可循，消耗一目了然。你的本地运行监控台。</p></div><div class="hero-meta">''')
     A('<span class="muted">%s · 数据生成时间</span><time class="generation" id="generated-at">%s</time></div></section>'
-      % ('本地服务，按请求生成' if served else '静态快照，生成后不再更新', esc(meta['generated_at'])))
+      % ('动态后台 · 5 秒短缓存' if served else '静态快照，生成后不再更新', esc(meta['generated_at'])))
     A('<details class="metadata" id="report-metadata"><summary>数据来源与生成信息</summary>'
       '<p>记账目录：<code>%s</code><br>标记：%s · 文件 %s 个 · 跳过损坏行 %s 条</p></details>'
       % (esc(meta['data_dir']), esc(meta.get('title_note') or '本地报告'), esc(meta.get('files', 0)), esc(meta.get('bad', 0))))
-    A('<noscript><div class="banner">JavaScript 未启用：所有数据仍完整可读；搜索与手动刷新不可用。%s</div></noscript>'
+    A('<noscript><div class="banner">JavaScript 未启用：所有数据仍完整可读；手动刷新不可用。%s</div></noscript>'
       % ('本地服务将每 %d 秒整页刷新。' % refresh if served and refresh else '此页面不会自动刷新。'))
     if not served and not meta.get("demo"):
-        # v0.6.2：静态快照主动引导开启实时版（回应"后台不是动态更新"的困惑）
-        A("<div class='banner banner-tip'>当前为静态快照，生成后不会自动更新。"
-          "想看实时版（浏览器每次访问都现场重算、每 30 秒自动刷新）："
-          "运行 <code>python report.py --serve</code> 或斜杠命令 <code>/wb-ops:report serve</code>，"
+        A("<div class='banner banner-tip'>当前为静态导出，生成后不会自动更新。"
+          "日常查看请打开固定动态后台（5 秒短缓存、每 30 秒局部更新）："
+          "运行 <code>python report.py --serve</code> 或斜杠命令 <code>/wb-ops:report</code>，"
           "再打开 <code>http://127.0.0.1:8787/</code>。</div>")
     if meta.get("demo"):
         A("<div class='banner'>示意报告：以下为全合成演示数据，仅预览版式，不代表真实使用情况。</div>")
@@ -875,7 +903,6 @@ def render_html(agg, meta):
         if meta.get("credit_bad"):
             A("<div class='banner'>%d 条会话积分记录解析失败，相关积分按 0 显示（数据仍保留在宿主库中）。</div>"
               % int(meta["credit_bad"]))
-    A('<p class="search-note" id="search-count" role="status" aria-live="polite">搜索仅筛选表格，不改变统计口径</p>')
 
     # ---- 概览卡：默认输出完整数值，无脚本也可读 ----
     saved = agg["total_b"] - agg["total_a"]
@@ -899,6 +926,23 @@ def render_html(agg, meta):
              esc(short_day(agg['days'][-1])) if agg['days'] else '—'))
     A('</div>')
 
+    # ---- 运行侧：与节省统计分开，避免混淆积分与 token ----
+    model_requests = sum(v.get('req', 0) for v in agg['models'].values())
+    model_input = sum(v.get('pin', 0) for v in agg['models'].values())
+    model_hits = sum(v.get('hit', 0) for v in agg['models'].values())
+    cache_rate = '%.1f%%' % (model_hits / model_input * 100) if model_input else '—'
+    runtime = [
+        ('累计积分', '%.1f' % agg['credit_total'], '宿主记账 · 非金额'),
+        ('模型请求', format(model_requests, ','), '%d 个模型 · 输入 %s tokens' % (len(agg['models']), fmt_tok(model_input))),
+        ('缓存命中率', cache_rate, '按输入 tokens 加权 · 非请求占比'),
+        ('上下文覆盖', str(len(agg['usage_rows'])), '会话 · 全量 transcript 直读'),
+    ]
+    A('<div class="runtime-strip" aria-label="运行指标">')
+    for label, value, note in runtime:
+        A('<div class="runtime-item"><span>%s</span><strong>%s</strong><small>%s</small></div>'
+          % (esc(label), esc(value), esc(note)))
+    A('</div>')
+
     # ---- 趋势（两栏）----
     A('<div class="section-label">01 / ACTIVITY TRENDS</div><div class="grid2">')
     A("<section class='panel' id='savings-trend'><h2>近 %d 天每日节省</h2>" % DAYS_SHOWN)
@@ -920,6 +964,11 @@ def render_html(agg, meta):
     A('<div class="section-label">02 / CONTEXT HEALTH</div>')
     A("<div class='panel' id='context-health'><h2>上下文占用（全量会话，≥%.0f%% 建议换新会话）</h2>"
       % (CTX_WARN_RATIO * 100))
+    warn_count = sum(1 for row in agg['usage_rows']
+                     if row.get('ratio') is not None and row['ratio'] >= CTX_WARN_RATIO)
+    A('<div class="health-summary"><span class="tag %s">%s</span>'
+      '<span class="muted">优先展示占用最高的 10 个会话 · 占用为末次请求，非累计输入</span></div>'
+      % ('warn' if warn_count else 'ok', '%d 个会话建议收尾' % warn_count if warn_count else '暂无高占用告警'))
     rows = agg["usage_rows"][:10]
     if not rows:
         A("<div class='empty'>暂无会话占用数据</div>")
@@ -943,7 +992,7 @@ def render_html(agg, meta):
             A("<tr><td>%s%s</td><td class='muted'>%s</td><td class='num' title='%s'>%s</td>"
               "<td>%s</td><td class='num muted'>%s</td></tr>"
               % (esc(r["title"][:38]), tag, esc(proj), esc(tip), pct_cell, bar_cell, ctxt))
-        A("</tbody></table></div><div class='empty search-empty' hidden>没有匹配的表格行，请尝试其他关键词。</div>")
+        A("</tbody></table></div>")
         A("<div class='muted' style='font-size:11.5px;margin-top:6px'>"
           "覆盖 %d 个会话（其中宿主窗口之外的 %d 个由 transcript 直读补齐）；"
           "占用 = 各会话末次请求的上下文 prompt_tokens（与宿主 used 一致）。</div>"
@@ -960,7 +1009,7 @@ def render_html(agg, meta):
             rt = (v["saved"] / v["b"] * 100.0) if v["b"] else 0
             A("<tr><td>%s</td><td class='num'>%d</td><td class='num green'>%s</td><td class='num'>%.0f%%</td></tr>"
               % (esc(tool), v["cnt"], hb(v["saved"]), rt))
-        A("</tbody></table></div><div class='empty search-empty' hidden>没有匹配的表格行，请尝试其他关键词。</div>")
+        A("</tbody></table></div>")
     else:
         A("<div class='empty'>暂无数据</div>")
     A("</div>")
@@ -970,7 +1019,7 @@ def render_html(agg, meta):
         for proj, v in sorted(agg["per_project"].items(), key=lambda kv: -kv[1]["saved"])[:8]:
             A("<tr><td>%s</td><td class='num'>%d</td><td class='num green'>%s</td></tr>"
               % (esc(proj), v["cnt"], hb(v["saved"])))
-        A("</tbody></table></div><div class='empty search-empty' hidden>没有匹配的表格行，请尝试其他关键词。</div>")
+        A("</tbody></table></div>")
     else:
         A("<div class='empty'>暂无数据</div>")
     A("</div></div>")
@@ -983,7 +1032,7 @@ def render_html(agg, meta):
         for r in top:
             A("<tr><td>%s</td><td class='muted'>%s</td><td class='num blue'>%.1f</td></tr>"
               % (esc(r["title"][:44]), esc(r["model"] or "-"), r["credits"]))
-        A("</tbody></table></div><div class='empty search-empty' hidden>没有匹配的表格行，请尝试其他关键词。</div>")
+        A("</tbody></table></div>")
     else:
         A("<div class='empty'>暂无积分数据</div>")
     A("</div>")
@@ -1012,7 +1061,7 @@ def render_html(agg, meta):
                  format(pin, ","), fmt_tok(pin),
                  format(int(v.get("pout", 0)), ","), fmt_tok(v.get("pout", 0)),
                  hit_cell, rate, lt))
-        A("</tbody></table></div><div class='empty search-empty' hidden>没有匹配的表格行，请尝试其他关键词。</div>")
+        A("</tbody></table></div>")
         A("<div class='muted' style='font-size:11.5px;margin-top:6px'>"
           "输入为每次请求的上下文累计（逐轮含完整历史，即计费口径）；"
           "缓存命中三格式归一提取（DeepSeek cache_hit / Anthropic cache_read / OpenAI cached_tokens）。"
@@ -1033,7 +1082,7 @@ def render_html(agg, meta):
               "<td class='num'>%s</td><td class='num'>%s</td><td class='num green'>%s</td></tr>"
               % (esc(day_str(r["t"]) + " " + datetime.fromtimestamp(r["t"] / 1000.0).strftime("%H:%M")),
                  esc(sid_label), esc(r["tool"]), hb(r["b"]), hb(r["a"]), hb(max(0, r["b"] - r["a"]))))
-        A("</tbody></table></div><div class='empty search-empty' hidden>没有匹配的表格行，请尝试其他关键词。</div>")
+        A("</tbody></table></div>")
     else:
         A("<div class='empty'>尚未产生记账数据。<br>"
           "每次 Grep/Glob 输出被裁剪时会自动记账；重新生成或从本地服务刷新即可查看。<br>"
@@ -1086,8 +1135,8 @@ def build_demo():
     host = {"ok": True, "err": "", "sessions": [
         {"id": "3fa2c1d8-1111-2222-3333-444455556666", "title": "wb-ops 记账与报告开发",
          "cwd": "d:/wb-ops", "model": "claude", "updated_at": 0},
-        {"id": "7b04e9aa-1111-2222-3333-444455556666", "title": "产品发布页文案润色",
-         "cwd": "d:/content", "model": "claude", "updated_at": 0},
+        {"id": "7b04e9aa-1111-2222-3333-444455556666", "title": "直播智能体 PPT 制作",
+         "cwd": "d:/直播智能体", "model": "claude", "updated_at": 0},
         {"id": "c91d2f31-1111-2222-3333-444455556666", "title": "C++ 线段树题目讨论",
          "cwd": "d:/oi", "model": "deepseek", "updated_at": 0},
         {"id": "05e83ba7-1111-2222-3333-444455556666", "title": "周报排版与公式校对",
@@ -1227,22 +1276,24 @@ def print_summary(html_txt, agg, info, args):
 
 
 def serve(args):
-    """本地实时服务：浏览器每次访问都现场跑一遍数据管线，报告永远最新。
-
-    仅绑定 127.0.0.1；5 秒内的并发请求共享同一份结果（避免重复磁盘扫描）；
-    单次生成失败时若有旧结果则沿用旧结果，只有首次就失败才返回 500。
-    """
+    """仅监听本机固定端口；身份完全一致才复用，不换端口、不终止其他进程。"""
+    import errno
     import http.server
+    import socket
     import threading
 
+    config = _service_config(args)
+    args = argparse.Namespace(**vars(args))
+    for key, value in config.items():
+        setattr(args, key, value)
+    identity = _service_identity(config)
     cache = {"html": None, "info": None, "t": 0.0, "stale": False}
     lock = threading.Lock()
-    live = max(0, args.refresh)
+    live = args.refresh
 
     def get_html():
         with lock:
-            now = time.time()
-            if cache["html"] is None or now - cache["t"] >= 5.0:
+            if cache["html"] is None or time.monotonic() - cache["t"] >= 5.0:
                 try:
                     html_txt, _agg, info = build(args, live_refresh=live, served=True)
                     cache["html"] = html_txt
@@ -1252,8 +1303,8 @@ def serve(args):
                     if cache["html"] is None:
                         raise
                     cache["stale"] = True
-                    print("  构建失败（沿用上一份结果）：%s" % e)
-                cache["t"] = now
+                    print("  构建失败（沿用上一份结果）：%s" % e, flush=True)
+                cache["t"] = time.monotonic()
             result = cache["html"]
             if cache["stale"]:
                 # 在返回副本标记失败，不改变缓存的完整报告或生成时间。
@@ -1268,52 +1319,85 @@ def serve(args):
         server_version = "wb-ops-report"
 
         def do_GET(self):
-            if self.path.split("?", 1)[0] not in ("/", "/index.html", "/dashboard.html"):
+            path = self.path.split("?", 1)[0]
+            if path == "/__wb_ops__/health":
+                # 不获取构建锁、不扫描磁盘，也不返回数据源路径。
+                body = json.dumps(dict(identity, ready=cache["html"] is not None),
+                                  separators=(",", ":")).encode("utf-8")
+                content_type = "application/json; charset=utf-8"
+            elif path in ("/", "/index.html", "/dashboard.html"):
+                try:
+                    body = get_html().encode("utf-8")
+                except Exception as e:
+                    # 异常详情不进入状态行，避免中文或换行污染响应头。
+                    sys.stderr.write("构建失败：%r\n" % (e,))
+                    self.send_error(500, "report build failed")
+                    return
+                content_type = "text/html; charset=utf-8"
+            else:
                 self.send_error(404, "Not Found")
                 return
-            try:
-                body = get_html().encode("utf-8")
-            except Exception as e:
-                # v0.6.1（S8）：状态行固定 ASCII —— send_error 的状态行不经清洗且以 latin-1
-                # 严格编码，异常原文含换行/中文会污染响应头甚至二次抛错；详情只写 stderr。
-                sys.stderr.write("构建失败：%r\n" % (e,))
-                self.send_error(500, "report build failed")
-                return
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, fmt, *a):  # 静默访问日志
+        def log_message(self, fmt, *a):
             pass
 
+    class ExclusiveHTTPServer(http.server.ThreadingHTTPServer):
+        allow_reuse_address = False
+        allow_reuse_port = False
+
+        def server_bind(self):
+            # Windows 的 SO_REUSEADDR 会允许第二个监听者抢占同端口。
+            if os.name == "nt":
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
     try:
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+        srv = ExclusiveHTTPServer(("127.0.0.1", args.port), Handler)
     except OSError as e:
-        print("端口 %d 无法监听（%s）；可换一个：python report.py --serve --port 8788"
-              % (args.port, e))
+        collision = e.errno in (errno.EADDRINUSE, errno.EACCES) or getattr(
+            e, "winerror", None) in (10013, 10048)
+        if args.port and collision:
+            # 同时启动时，先绑定者可能尚未来得及进入请求循环。
+            deadline = time.monotonic() + 2.0
+            while True:
+                health, reason, retry = _probe_service(args.port, identity)
+                if health is not None:
+                    print("复用已有实时报告服务：http://127.0.0.1:%d/" % args.port, flush=True)
+                    return 0
+                if not retry or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            print("端口 %d 已被占用，拒绝复用：%s。请停止旧服务后，以当前版本和配置重新启动；"
+                  "不会自动换端口或终止进程。" % (args.port, reason), file=sys.stderr)
+        else:
+            print("端口 %d 无法监听（%s）；不会自动换端口或终止进程。" % (args.port, e),
+                  file=sys.stderr)
         return 1
 
     port = srv.server_address[1]
-    print("实时报告服务已启动：http://127.0.0.1:%d/" % port)
-    print("  数据即扫即新%s；仅本机可访问；Ctrl+C 停止。"
-          % (("，页面每 %d 秒自动刷新" % live) if live > 0 else "（刷新页面即取最新）"))
-    sys.stdout.flush()
+    print("实时报告服务已监听：http://127.0.0.1:%d/" % port, flush=True)
+    print("  首次数据后台加载中；健康检查已可用；仅本机可访问；Ctrl+C 停止。", flush=True)
+    print("  %s。" % (("页面每 %d 秒自动刷新" % live) if live > 0 else "自动刷新已关闭，可手动刷新"),
+          flush=True)
 
-    t0 = time.perf_counter()
-    try:
-        get_html()
-        _info = cache.get("info") or {}
-        n_rec = len(_info.get("records") or [])
-        print("  首次数据已就绪（%.1fs%s）。"
-              % (time.perf_counter() - t0, "，记账 %d 条" % n_rec if n_rec else ""))
-    except Exception as e:
-        print("  首次加载失败（%s）—— 服务仍可访问，页面每次请求会重试。" % e)
-    sys.stdout.flush()
+    def warm_up():
+        t0 = time.monotonic()
+        try:
+            get_html()
+            n_rec = len((cache.get("info") or {}).get("records") or [])
+            print("  首次数据已就绪（%.1fs%s）。"
+                  % (time.monotonic() - t0, "，记账 %d 条" % n_rec if n_rec else ""), flush=True)
+        except Exception as e:
+            print("  首次加载失败（%s）—— 服务仍可访问，页面每次请求会重试。" % e, flush=True)
 
     try:
+        threading.Thread(target=warm_up, daemon=True, name="wb-ops-report-warmup").start()
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n服务已停止。")
@@ -1322,22 +1406,99 @@ def serve(args):
     return 0
 
 
+SERVICE_ID = "wb-ops-report"
+SERVICE_PROTOCOL = "wb-ops-report/1"
+SERVICE_VERSION = "0.6.3"
+
+
+def _service_config(args):
+    paths = default_paths()
+    config = {}
+    for key in ("data_dir", "db", "projects"):
+        value = getattr(args, key, None) or paths[key]
+        config[key] = os.path.normcase(os.path.realpath(os.path.abspath(os.path.expanduser(value))))
+    config.update(demo=bool(args.demo), no_prune=bool(args.no_prune), refresh=max(0, args.refresh))
+    return config
+
+
+def _service_identity(config):
+    import hashlib
+
+    encoded = json.dumps(config, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return {"service": SERVICE_ID, "protocol": SERVICE_PROTOCOL, "version": SERVICE_VERSION,
+            "config_fingerprint": hashlib.sha256(encoded).hexdigest()}
+
+
+def _probe_service(port, expected):
+    """有限读取本机健康 JSON；禁用系统代理及重定向，绝不按 Server 响应头认身份。"""
+    import http.client
+    import urllib.error
+    import urllib.request
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    url = "http://127.0.0.1:%d/__wb_ops__/health" % port
+    try:
+        with opener.open(url, timeout=0.4) as response:
+            if response.status != 200:
+                return None, "健康端点未返回 200", False
+            body = response.read(4097)
+        if len(body) > 4096:
+            return None, "健康响应超过大小限制", False
+        health = json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        e.close()
+        return None, "占用者没有兼容的健康端点", False
+    except (urllib.error.URLError, OSError):
+        return None, "占用者未及时响应健康检查", True
+    except (http.client.HTTPException, ValueError, UnicodeError, RecursionError):
+        return None, "占用者未返回有效的健康 JSON", False
+    if not isinstance(health, dict) or any(health.get(key) != expected[key]
+                                         for key in ("service", "protocol")):
+        return None, "占用者不是兼容协议的 wb-ops 服务", False
+    if health.get("version") != expected["version"]:
+        return None, "版本不匹配（需要 wb-ops %s）" % expected["version"], False
+    if health.get("config_fingerprint") != expected["config_fingerprint"]:
+        return None, "配置不匹配（数据源或刷新/裁剪配置不同）", False
+    return health, "", False
+
+
 def main():
     ap = argparse.ArgumentParser(description="wb-ops 节省与 Token 报告生成器")
-    ap.add_argument("--out", default=None, help="输出 HTML 路径")
+    ap.add_argument("--out", default=None, help="静态导出 HTML 路径")
     ap.add_argument("--data-dir", default=None, help="记账数据目录（默认 ~/.workbuddy/wb-ops-data）")
     ap.add_argument("--db", default=None, help="workbuddy.db 路径")
     ap.add_argument("--projects", default=None, help="transcript 目录（默认 ~/.workbuddy/projects）")
     ap.add_argument("--no-prune", action="store_true", help="不清理过期的记账文件")
-    ap.add_argument("--open", action="store_true", help="生成后用默认浏览器打开")
+    ap.add_argument("--open", action="store_true", help="静态导出后用默认浏览器打开")
     ap.add_argument("--demo", action="store_true", help="用合成数据生成示意报告")
-    ap.add_argument("--serve", action="store_true", help="启动本地实时服务：浏览器每次访问都拿到最新报告")
-    ap.add_argument("--port", type=int, default=8787, help="实时服务端口（默认 8787；0 = 自动分配）")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--serve", action="store_true", help="启动或复用配置一致的本机动态报告服务")
+    mode.add_argument("--snapshot", action="store_true", help="显式静态导出（不启动服务；无参时也保留此行为）")
+    mode.add_argument("--status", action="store_true", help="探测指定端口的服务身份（不扫描数据）")
+    ap.add_argument("--port", type=int, default=8787, help="实时服务端口（默认固定 8787；0 = 自动分配）")
     ap.add_argument("--refresh", type=int, default=30, help="实时页面自动刷新间隔秒（0 = 关闭）")
     args = ap.parse_args()
+    if not 0 <= args.port <= 65535:
+        ap.error("--port 必须在 0 到 65535 之间")
+    if args.refresh < 0:
+        ap.error("--refresh 不能为负数")
+    if args.status and args.port == 0:
+        ap.error("--status 需要确定的非零端口")
 
     if args.serve:
         return serve(args)
+    if args.status:
+        health, reason, _retry = _probe_service(args.port, _service_identity(_service_config(args)))
+        if health is None:
+            print("服务探测失败：%s。请以当前版本和配置重启旧服务。" % reason, file=sys.stderr)
+            return 1
+        print("服务身份匹配，已监听：http://127.0.0.1:%d/（%s）" % (
+            args.port, "数据已就绪" if health.get("ready") is True else "首次数据加载中"))
+        return 0
 
     html_txt, agg, info = build(args)
     out_path = info["out_path"]

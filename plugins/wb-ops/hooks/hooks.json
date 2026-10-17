@@ -1,12 +1,12 @@
 {
-  "description": "wb-ops: 工具输出压缩（Grep/Glob/WebFetch）+ 记忆守卫（SessionStart 检查用户记忆超限并提醒精简）+ 上下文守卫 v2（UserPromptSubmit：学习各模型真实自动压缩点、三档提醒、压缩后水位检查）+ 压缩指令注入（PreCompact：为压缩摘要注入保留清单）",
+  "description": "wb-ops: 工具输出压缩（Grep/Glob/WebFetch/Bash，Read 需 WB_OPS_READ_TRIM=1 才启用）+ 记忆守卫（SessionStart 检查用户记忆超限并提醒精简）+ 上下文守卫 v2（UserPromptSubmit：学习各模型真实自动压缩点、三档提醒、压缩后水位检查）+ 压缩指令注入（PreCompact：为压缩摘要注入保留清单）；v0.6.9：PostToolUse matcher 接入 Bash（退出码非 0 时原样透传）与 Read（默认关闭，仅对 >1500 行长文件生效、保留首尾与符号行），省略标记附被省略区间的行号范围。v0.6.8：主动压缩督导的 modules 入口已移除（该 mod 与宿主轮末 Gate 抢跑，会让本轮结果被丢弃、UI 卡在“思考中”），mod/supervisor.mjs 仅归档并需 WB_OPS_COMPACT_UNSAFE=1 才可能压缩。v0.6.6：每条命令在取到插件根后先把 R 里的反斜杠归一化为正斜杠——宿主若注入全反斜杠路径，H 的 /plugins/cache/ 截断不再命中，node 类守卫会静默不执行（0.6.5 测试发现的 D2）。v0.6.5：解释器候选路径改为从插件根推导宿主根（H），不再硬编码某一套宿主的绝对路径——本机并存 WorkBuddy(~/.workbuddy) 与 WorkBuddyAI(~/.workbuddy-ai) 两套宿主，各自 binaries 不同。",
   "hooks": {
     "UserPromptSubmit": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; S=\"$R/hooks/ctx-guard.mjs\"; for N in \"$(command -v node)\" \"$HOME/.workbuddy/binaries/node/versions/\"*/node.exe \"/c/Program Files/nodejs/node.exe\"; do [ -n \"$N\" ] && [ -x \"$N\" ] && \"$N\" \"$S\" && break; done; exit 0",
+            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; R=\"${R//\\\\\\\\//}\"; H=\"${R%%/plugins/cache/*}\"; S=\"$R/hooks/ctx-guard.mjs\"; for N in \"$(command -v node)\" \"$H\"/binaries/node/versions/*/node.exe \"/c/Program Files/nodejs/node.exe\"; do [ -n \"$N\" ] && [ -x \"$N\" ] && \"$N\" \"$S\" && break; done; exit 0",
             "timeout": 5
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; S=\"$R/hooks/memory-guard.mjs\"; for N in \"$(command -v node)\" \"$HOME/.workbuddy/binaries/node/versions/\"*/node.exe \"/c/Program Files/nodejs/node.exe\"; do [ -n \"$N\" ] && [ -x \"$N\" ] && \"$N\" \"$S\" && break; done; exit 0",
+            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; R=\"${R//\\\\\\\\//}\"; H=\"${R%%/plugins/cache/*}\"; S=\"$R/hooks/memory-guard.mjs\"; for N in \"$(command -v node)\" \"$H\"/binaries/node/versions/*/node.exe \"/c/Program Files/nodejs/node.exe\"; do [ -n \"$N\" ] && [ -x \"$N\" ] && \"$N\" \"$S\" && break; done; exit 0",
             "timeout": 5
           }
         ]
@@ -25,11 +25,11 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Grep|Glob|WebFetch",
+        "matcher": "Grep|Glob|WebFetch|Bash|Read",
         "hooks": [
           {
             "type": "command",
-            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; [ -f \"$R/bin/TRACE-ON\" ] && export WB_OPS_TRACE=1; E=\"$R/bin/wb-ops-trim.exe\"; if [ -x \"$E\" ]; then \"$E\"; else for PY in \"$(command -v python)\" \"$(command -v python3)\" \"$HOME/.workbuddy/binaries/python/versions/\"*/python.exe /c/Python3*/python.exe; do [ -n \"$PY\" ] && [ -x \"$PY\" ] && \"$PY\" \"$R/hooks/trim.py\" && break; done; fi; exit 0",
+            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; R=\"${R//\\\\\\\\//}\"; H=\"${R%%/plugins/cache/*}\"; [ -f \"$R/bin/TRACE-ON\" ] && export WB_OPS_TRACE=1; E=\"$R/bin/wb-ops-trim.exe\"; if [ -x \"$E\" ]; then \"$E\"; else for PY in \"$(command -v python)\" \"$(command -v python3)\" \"$H\"/binaries/python/versions/*/python.exe \"/c/Python314/python.exe\"; do [ -n \"$PY\" ] && [ -x \"$PY\" ] && \"$PY\" \"$R/hooks/trim.py\" && break; done; fi; exit 0",
             "timeout": 10
           }
         ]
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; S=\"$R/hooks/precompact.mjs\"; for N in \"$(command -v node)\" \"$HOME/.workbuddy/binaries/node/versions/\"*/node.exe \"/c/Program Files/nodejs/node.exe\"; do [ -n \"$N\" ] && [ -x \"$N\" ] && \"$N\" \"$S\" && break; done; exit 0",
+            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; R=\"${R//\\\\\\\\//}\"; H=\"${R%%/plugins/cache/*}\"; S=\"$R/hooks/precompact.mjs\"; for N in \"$(command -v node)\" \"$H\"/binaries/node/versions/*/node.exe \"/c/Program Files/nodejs/node.exe\"; do [ -n \"$N\" ] && [ -x \"$N\" ] && \"$N\" \"$S\" && break; done; exit 0",
             "timeout": 5
           }
         ]

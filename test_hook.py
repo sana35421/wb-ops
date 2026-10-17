@@ -20,8 +20,8 @@ wb-ops / 裁剪 hook 的自测
 用法：python test_hook.py
 """
 
-import glob
 import json
+import glob
 import os
 import shutil
 import subprocess
@@ -38,19 +38,36 @@ PRECOMPACT = os.path.join(PLUGIN, "hooks", "precompact.mjs")
 os.environ["WB_OPS_STATS"] = "0"
 
 
+# v0.6.6/D3：统计因缺少 node 而未执行的用例数，收尾时显式告警，避免「整体 SKIP 却全绿」
+_SKIPPED = [0]
+
+
 def find_node():
-    """定位 node 可执行文件（记忆守卫的运行时）。"""
+    """定位 node 可执行文件（守卫脚本的运行时）。
+
+    v0.6.6/D3：不再硬编码某一套宿主的绝对路径。本机可能并存两套宿主
+    （~/.workbuddy 与 ~/.workbuddy-ai），且各自 binaries 下的 node 版本号不同，
+    因此按「PATH -> 两套宿主 binaries 通配（新版本优先）-> 系统安装路径」查找。
+    """
     n = shutil.which("node")
     if n:
         return n
-    # 兜底：WorkBuddy 托管 node（版本目录通配）+ 系统默认安装位置
-    cands = glob.glob(os.path.join(os.path.expanduser("~"), ".workbuddy",
-                                   "binaries", "node", "versions", "*", "node.exe"))
-    cands.append(r"C:\Program Files\nodejs\node.exe")
+    home = os.path.expanduser("~")
+    cands = []
+    for host in (".workbuddy-ai", ".workbuddy"):
+        cands += sorted(glob.glob(os.path.join(
+            home, host, "binaries", "node", "versions", "*", "node.exe")), reverse=True)
+    cands += [r"C:\Program Files\nodejs\node.exe", "/usr/local/bin/node", "/usr/bin/node"]
     for p in cands:
-        if os.path.exists(p):
+        if os.path.isfile(p):
             return p
     return None
+
+
+def skip(tag, name):
+    """记录一项因缺少 node 而未执行的用例（收尾时统一告警）。"""
+    _SKIPPED[0] += 1
+    print("%s %-18s SKIP（未找到 node，本项未验证）" % (tag, name))
 
 
 def run_guard(limit=None, mode=None, home=None):
@@ -210,7 +227,7 @@ def main():
 
     # ---- 用例 4：记忆守卫（v0.3.6 起，SessionStart hook；v0.6.1 起用例自包含）----
     if not find_node():
-        print("[4] 记忆守卫           SKIP（未找到 node）")
+        skip("[4]", "记忆守卫")
     else:
         # 自包含夹具（T1）：在临时 HOME 下构造 ~/.workbuddy/user-test-personal/MEMORY.md
         # （约 260 字符：>50 可触发 limit=50，<3500 对默认阈值静默），注入 USERPROFILE/HOME 运行。
@@ -276,7 +293,7 @@ def main():
 
     # ---- 用例 5：上下文守卫（v0.3.8 起，UserPromptSubmit hook）----
     if not find_node():
-        print("[5] 上下文守卫         SKIP（未找到 node）")
+        skip("[5]", "上下文守卫")
     else:
         tmp = tempfile.mkdtemp(prefix="wb-ops-ctx-")
         try:
@@ -529,7 +546,7 @@ def main():
 
     # ---- 用例 6：PreCompact hook（v0.6.0 起：压缩保留清单注入）----
     if not find_node():
-        print("[6] PreCompact          SKIP（未找到 node）")
+        skip("[6]", "PreCompact")
     else:
         def run_precompact(raw):
             proc = subprocess.run(
@@ -561,8 +578,17 @@ def main():
 
     print()
     print("=" * 50)
-    print("全部通过 ✓" if ok else "有失败项 ✗")
-    return 0 if ok else 1
+    # v0.6.6/D3：缺 node 时不再静默全绿 —— 用退出码 2 与「有失败」区分
+    if _SKIPPED[0]:
+        print("⚠ %d 项因缺少 node 未执行，本次结果不代表全绿" % _SKIPPED[0])
+    if not ok:
+        print("有失败项 ✗")
+        return 1
+    if _SKIPPED[0]:
+        print("已执行项全部通过，但有用例被跳过 △")
+        return 2
+    print("全部通过 ✓")
+    return 0
 
 
 if __name__ == "__main__":

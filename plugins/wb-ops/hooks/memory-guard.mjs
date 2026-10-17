@@ -29,22 +29,35 @@ const TARGET = Math.max(1200, Math.round(SOFT_LIMIT * 0.7)); // 压缩目标：�
 
 /** 找出所有超限的用户级记忆文件，返回 [{path, chars}] */
 function findOversizedMemoryFiles() {
-  const base = path.join(os.homedir(), '.workbuddy');
-  const out = [];
-  let names = [];
-  try {
-    names = fs.readdirSync(base);
-  } catch {
-    return out;
-  }
-  for (const n of names) {
-    if (!/^user-.*-personal$/.test(n)) continue;
-    const p = path.join(base, n, 'MEMORY.md');
+  // 2026-10-17 修复：原来只扫 ~/.workbuddy，而新宿主 WorkBuddyAI 的用户目录在
+  // ~/.workbuddy-ai，导致守卫在那边永远扫不到东西（静默失效）。改为扫描所有存在的宿主根。
+  const homes = [];
+  for (const name of ['.workbuddy-ai', '.workbuddy']) {
+    const h = path.join(os.homedir(), name);
     try {
-      const chars = fs.readFileSync(p, 'utf-8').length;
-      if (chars > SOFT_LIMIT) out.push({ p, chars });
+      if (fs.statSync(h).isDirectory()) homes.push(h);
     } catch {
-      /* 目录不存在 / 文件缺失：跳过 */
+      /* 该宿主不存在：跳过 */
+    }
+  }
+
+  const out = [];
+  for (const base of homes) {
+    let names = [];
+    try {
+      names = fs.readdirSync(base);
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      if (!/^user-.*-personal$/.test(n)) continue;
+      const p = path.join(base, n, 'MEMORY.md');
+      try {
+        const chars = fs.readFileSync(p, 'utf-8').length;
+        if (chars > SOFT_LIMIT) out.push({ p, chars });
+      } catch {
+        /* 目录不存在 / 文件缺失：跳过 */
+      }
     }
   }
   return out;
