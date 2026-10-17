@@ -178,12 +178,16 @@ def build_edges():
     cs.append(("tool_response 为空数组", payload_of("Grep", []), "pass"))
     cs.append(("数组含非字符串元素", payload_of("Grep", [1, None, {"a": 1}]), "pass"))
     cs.append(("恰好 120 行", payload_of("Grep", ["line %03d short" % i for i in range(120)]), "pass"))
-    cs.append(("121 行", payload_of("Grep", ["line %03d short" % i for i in range(121)]), "trim"))
+    # v1.1：头尾行数按预算自适应后，121 行短行（约 2KB）整体装得进 8KB 预算 →
+    # 裁掉反而只省几个字节却丢信息，按「不值得裁」透传（旧版写死头 50/尾 25 才会裁）。
+    cs.append(("121 行短行（整体装得下→透传）",
+               payload_of("Grep", ["line %03d short" % i for i in range(121)]), "pass"))
     cs.append(("恰好 8000 字节单行", payload_of("Grep", "a" * 8000), "pass"))
     cs.append(("8001 字节单行", payload_of("Grep", "a" * 8001), "trim"))
     cs.append(("80 行×120B=9600（长文本路径）", payload_of("Grep", ["x" * 120] * 80), "trim"))
     cs.append(("81 行×120B=9720（正常路径）", payload_of("Grep", ["x" * 120] * 81), "trim"))
-    cs.append(("CRLF 行文本", payload_of("Grep", ["line with crlf %03d" % i for i in range(200)]), "trim"))
+    # v1.1：CRLF 夹具放大到 900 行（约 20KB），确保真正走裁剪路径而不是整体透传
+    cs.append(("CRLF 行文本", payload_of("Grep", ["line with crlf %03d" % i for i in range(900)]), "trim"))
     cs.append(("200KB 单行", payload_of("Grep", "q" * 200000), "trim"))
     cs.append(("转义密集文本（引号/反斜杠/制表符）",
                payload_of("Grep", ('quotes " and \\ backslash and \t tab ' * 600)), "trim"))
@@ -192,8 +196,11 @@ def build_edges():
     cs.append(("emoji 文本", payload_of("Grep", ("🙂" * 3000)), "trim"))
     cs.append(("emoji 转义载荷（代理对）",
                payload_of("Grep", "🙂" * 3000, ascii_escape=True), None))
-    cs.append(("dict/stdout 形态",
-               payload_of("Bash", {"stdout": "o" * 20000, "stderr": "", "exitCode": 1}), "trim"))
+    # v1.1（P0-2）：exitCode 非 0 = 失败，整段透传；成功（exitCode 0）才裁剪
+    cs.append(("Bash dict + exitCode 1（失败透传）",
+               payload_of("Bash", {"stdout": "o" * 20000, "stderr": "", "exitCode": 1}), "pass"))
+    cs.append(("Bash dict + exitCode 0（成功裁剪）",
+               payload_of("Bash", {"stdout": "o" * 20000, "stderr": "", "exitCode": 0}), "trim"))
     cs.append(("MCP 文本数组", payload_of("Grep", [{"type": "text", "text": "m" * 15000}]), "trim"))
     cs.append(("贴上限裁剪（8MB-4KB）",
                payload_of("Grep", "z" * (8 * MB - 4096)), "trim"))

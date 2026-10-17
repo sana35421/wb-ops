@@ -125,12 +125,14 @@ def run_hook(payload):
 
 
 def build_big_output():
+    # v1.1：输出预算默认 8KB，夹具随之放大到 ~1900 行，
+    # 否则「省 >50%」在物理上不可能达到（9KB 输入最多只能省 18%）。
     lines = ["$ make"]
-    lines += ["  CC  src/parser.o" for _ in range(200)]
+    lines += ["  CC  src/parser.o" for _ in range(700)]
     lines.append("src/parser.cpp:87:14: error: 'node' was not declared in this scope")
-    lines += ["  CC  src/tree.o" for _ in range(150)]
+    lines += ["  CC  src/tree.o" for _ in range(600)]
     lines.append("src/tree.cpp:203:5: warning: unused variable 'tmp'")
-    lines += ["  CC  src/main.o" for _ in range(150)]
+    lines += ["  CC  src/main.o" for _ in range(600)]
     lines.append("make: *** [Makefile:12: src/parser.o] Error 1")
     return "\n".join(lines)
 
@@ -138,18 +140,18 @@ def build_big_output():
 def main():
     ok = True
 
-    # ---- 用例 1：大输出应被裁剪且保留关键行 ----
+    # ---- 用例 1：大输出应被裁剪且保留关键行（成功输出）----
     big = build_big_output()
     out, code = run_hook(
         {
             "hook_event_name": "PostToolUse",
             "tool_name": "Bash",
-            "tool_input": {"command": "make"},
-            "tool_response": {"stdout": big, "stderr": "", "exitCode": 2},
+            "tool_input": {"command": "make -k"},
+            "tool_response": {"stdout": big, "stderr": "", "exitCode": 0},
         }
     )
     if code != 0 or not out:
-        print("[1] 大输出           FAIL  预期会输出裁剪结果，实际为空")
+        print("[1a] 大输出（成功）      FAIL  预期会输出裁剪结果，实际为空")
         ok = False
     else:
         payload = json.loads(out)
@@ -159,14 +161,35 @@ def main():
         has_warn = "unused variable" in trimmed
         has_tail = "Error 1" in trimmed
         has_marker = "wb-ops" in trimmed
-        print("[1] 大输出           原 %d 字符 -> %d 字符，省 %.0f%%" % (len(big), len(trimmed), ratio * 100))
-        print("    保留 error 行：%s   保留 warning 行：%s" % (has_err, has_warn))
-        print("    保留结尾：%s       带省略标记：%s" % (has_tail, has_marker))
+        print("[1a] 大输出（成功）      原 %d 字符 -> %d 字符，省 %.0f%%" % (len(big), len(trimmed), ratio * 100))
+        print("     保留 error 行：%s   保留 warning 行：%s" % (has_err, has_warn))
+        print("     保留结尾：%s       带省略标记：%s" % (has_tail, has_marker))
         if not (has_err and has_warn and has_tail and has_marker and ratio > 0.5):
-            print("    FAIL  裁剪结果不符合预期")
+            print("     FAIL  裁剪结果不符合预期")
             ok = False
         else:
-            print("    PASS")
+            print("     PASS")
+    print()
+
+    # ---- 用例 1b（v1.1）：失败输出整段透传，报错现场绝不裁剪 ----
+    for label, resp in (
+        ("exitCode: 2", {"stdout": big, "stderr": "", "exitCode": 2}),
+        ("is_error: true", {"stdout": big, "is_error": True}),
+        ("tool_error_code", {"stdout": big, "tool_error_code": "CommandFailed"}),
+    ):
+        out, code = run_hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "make"},
+                "tool_response": resp,
+            }
+        )
+        if code == 0 and out == "":
+            print("[1b] 失败透传 %-16s PASS" % label)
+        else:
+            print("[1b] 失败透传 %-16s FAIL  失败输出被裁剪，报错现场丢失" % label)
+            ok = False
     print()
 
     # ---- 用例 2：小输出应原样透传 ----

@@ -4,11 +4,15 @@
 会话临近自动压缩点之前主动提醒（省心），记忆文件超限时自动收拾（防截断），
 并自带一本"省了多少"的账与可视化报告后台。
 
-当前版本 **1.0.0** ｜ 宿主 WorkBuddy 5.8.2（Windows 实测） ｜ [MIT License](LICENSE)
+当前版本 **1.1.0** ｜ 宿主 WorkBuddy 5.8.2（Windows 实测） ｜ [MIT License](LICENSE)
 
-> **1.0.0 是首个稳定版**：功能与 0.6.9 一致，不引入新行为，只是把已验证的功能集冻结下来。
-> 自本版起冻结对外契约——环境变量、省略标记格式、hook 事件集、数据文件格式、安装布局；
-> 破坏性改动只会在 2.0 出现。
+> **1.1.0 是「默认行为正确性」版**：① PostToolUse matcher 摘掉 Bash——宿主对 Bash 的 `tool_response`
+> 只下发元数据（`exitCode` / `stdoutBytesTruncated`…），正文不在载荷里，hook 无从裁剪，命中一次只白付
+> 约 270ms 进程开销；② 失败输出改为按结构化信号（`is_error` / 退出码非 0 / `tool_error_code`）整段透传，
+> 报错现场不再被裁；③ 头尾行数不再写死 50/25，按平均行长估算并逐轮扩张，预算利用率 58% → 93%+；
+> ④ 已带 wb-ops 标记的文本不再二次裁剪；⑤ JSON 原文被截断时标记里显式提示；⑥ 账本过滤探头记录。
+> **1.0.0 是首个稳定版**：自本版起冻结对外契约——环境变量、省略标记格式、hook 事件集、数据文件格式、
+> 安装布局；破坏性改动只会在 2.0 出现。
 > 装完想自检：`python test_release.py`（在临时宿主里跑完整生命周期，不碰你现有的 WorkBuddy，
 > 十几秒出结果）、`python test_hook.py`（注册与行为）、`python test_parity.py`（双实现逐字节一致）。
 
@@ -21,7 +25,7 @@ wb-ops 在四个位置介入，把这个成本压下去：
 
 | # | 链路 | 时机 | 做什么 |
 |---|------|------|--------|
-| 1 | **输出裁剪** | 每次 Grep / Glob / WebFetch / Bash 之后 | 长输出压缩到预算内再进上下文（默认 ≤ 8000 字节），关键行与结尾优先保留；**Bash 失败（退出码非 0）整段透传**，报错现场不动 |
+| 1 | **输出裁剪** | 每次 Grep / Glob / WebFetch 之后 | 长输出压缩到预算内再进上下文（默认 ≤ 8000 字节），头尾行数按预算自适应，关键行与结尾优先保留；**失败输出（`is_error` / 退出码非 0 / 工具错误码）整段透传**，报错现场不动 |
 | 2 | **上下文守卫 v2** | 每次提交消息时 | 学习各模型真实的自动压缩触发点，三档提醒（轻档 / 强档 / 越过压缩点仍未触发）收尾或换新会话 |
 | 3 | **记忆守卫** | 新会话启动时 | 用户级记忆超限（默认 3500 字符）时自动压缩（带备份），防止被宿主静默截断 |
 | 4 | **压缩保留清单** | 宿主执行自动压缩时 | 注入"什么必须保留"（任务目标 / 未决事项 / 关键决策…），让压缩摘要不失忆 |
@@ -34,9 +38,9 @@ wb-ops 在四个位置介入，把这个成本压下去：
 |---|---|---|
 | 单次大输出裁剪 | **大输入约 80–95%** | 接近阈值的小输入可能不足 80%；50KB → ≤8KB（硬上界，实测约 4.8KB）；3000 行 → ≤8KB（实测约 1.9KB） |
 | 重型会话输入重放 | **-81%** | 与"从未压缩"反事实对照（518 次请求的重型会话） |
-| 截断开销 | 原生 exe 纯处理 **~2.4ms**（含进程启动 ~70ms） | 经 bash 包装后整体 ~0.3s/次（Grep/Glob/WebFetch/Bash） |
+| 截断开销 | 原生 exe 纯处理 **~2.4ms**（含进程启动 ~70ms） | 经 bash 包装后整体 ~0.3s/次（仅 Grep/Glob/WebFetch；Bash 不参与，无此开销） |
 | 守卫开销 | 每消息 ~0.26s（尾部直读） | 未达阈值零输出、零注入 |
-| 测试覆盖 | **520 项全绿** | 边界 / fuzz / 并发 / 长跑 / 双实现逐字节一致 |
+| 测试覆盖 | **490 项全绿** | 边界 / fuzz / 并发 / 长跑 / 双实现逐字节一致 |
 
 > 裁剪不是"砍内容"：ERROR / warning 关键字行、结尾段、命中抽样会按规则优先保留，
 > 并附带显式省略标记（`… [wb-ops 省略 N 行（第 X–Y 行），……] …`），带被省略段的**行号区间**，
@@ -77,6 +81,7 @@ python install_wb_ops.py
 
 ```bash
 git pull && python install_wb_ops.py sync   # 更新到最新版
+# 想同时启用 Read 裁剪：python install_wb_ops.py sync --with-read（另需 WB_OPS_READ_TRIM=1）
 python install_wb_ops.py uninstall          # 卸载（按字段移除本插件注册条目，只删本插件目录/快照）
 python install_wb_ops.py status             # 查看注册状态
 ```
@@ -85,7 +90,8 @@ python install_wb_ops.py status             # 查看注册状态
 
 ### 自动部分（装完即生效，无需任何操作）
 
-- **裁剪**：对 Grep / Glob / WebFetch / Bash 的长输出自动生效；短输出与 Bash 失败输出原样透传
+- **裁剪**：对 Grep / Glob / WebFetch 的长输出自动生效；短输出与失败输出原样透传
+  （Bash 不参与——宿主只向 hook 下发元数据，拿不到正文，见[兼容性与边界](#兼容性与边界)）
 - **守卫**：接近自动压缩点时，模型会在回复末尾顺带出现一句提醒（如"话题告一段落，可开新会话"），
   同档位每会话只提醒一次，不刷屏
 
@@ -131,7 +137,7 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 | `WB_OPS_CTX_GUARD_DIR` | `~/.workbuddy/wb-ops-data` | 守卫状态文件目录 |
 | `WB_OPS_MEM_GUARD_LIMIT` | `3500` | 记忆字符阈值（超过即触发） |
 | `WB_OPS_MEM_GUARD_MODE` | `auto` | `auto` 自动压缩 / `remind` 仅提醒 |
-| `WB_OPS_READ_TRIM` | 关 | 置 `1` 开启 Read 按需裁剪（仅对 >1500 行的文件生效） |
+| `WB_OPS_READ_TRIM` | 关 | 置 `1` 开启 Read 按需裁剪（仅对 >1500 行的文件生效）；还需安装时加 `--with-read` 把 Read 写进 matcher |
 | `WB_OPS_TRACE` | 关 | 置 `1`（或放 `bin/TRACE-ON`）打开 `bin/trace.log` 调试日志 |
 
 ## 工作原理
@@ -139,7 +145,7 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 > 下图中路径均为插件包内相对路径（对应仓库的 `plugins/wb-ops/` 目录）。
 
 ```
-【裁剪链路】每次 Grep / Glob / WebFetch / Bash
+【裁剪链路】每次 Grep / Glob / WebFetch
   工具调用 ──> PostToolUse hook（hooks/hooks.json）
                  │
                  ├─ bin/wb-ops-trim.exe          ← 原生实现（纯处理 ~2.4ms，静态编译）
@@ -173,9 +179,15 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
   macOS / Linux 可用 Python 回退路径，但未实测——欢迎 PR 验证。
 - **隐私**：零网络请求、零遥测；所有数据只在本机读写。
   账本只记录尺寸 / 时间 / 会话前缀；报告为本地单文件。
-- **覆盖范围**：Grep / Glob / WebFetch / Bash 成功输出。Bash 退出码非 0 时整段透传（报错现场优先于省字节）。
-  Read 默认不裁剪：设 `WB_OPS_READ_TRIM=1` 才对**超过 1500 行**的文件生效，保留首 200 / 尾 120 行并捞回
-  `#include` / `def` / `class` / `struct` / `import` 等符号行。
+- **覆盖范围**：Grep / Glob / WebFetch 的输出。**失败输出整段透传**（`is_error` / `exitCode`≠0 /
+  `tool_error_code` 非 0 / `error` 非空，任一命中即不裁剪）——报错现场优先于省字节。
+- **Bash 为什么不在名单里**：宿主取工具结果用的是「工具自带 → `rawResponse` → `content`」三级回退，
+  Bash 的 `rawResponse` 只有元数据（`exitCode` / `signal` / `*BytesTruncated` / `tool_error_code`），
+  正文在 `content` 里，hook 侧永远取不到可裁剪的文本。从 transcript 补齐也走不通：hook 触发时
+  当前调用的结果尚未落盘（只有 `function_call`，没有 `function_call_result`）。因此 Bash 不入 matcher，
+  省下每次约 270ms 的空跑开销；裁剪器里的 Bash 分支保留，宿主改为下发正文即可加回。
+- **Read 默认不裁剪**：安装时加 `--with-read` 把 Read 写进 matcher，再设 `WB_OPS_READ_TRIM=1`，才对
+  **超过 1500 行**的文件生效，保留首 200 / 尾 120 行并捞回 `#include` / `def` / `class` / `struct` / `import` 等符号行。
 - **已知边界**（设计使然，非缺陷）：守卫状态文件无锁（最坏情形为偶发重复或漏一次提醒）；
   守卫提醒依赖模型转述；每次会话首条消息恒静默。
 
@@ -196,7 +208,7 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 | `plugins/wb-ops/commands/report.md` | `/wb-ops:report` 斜杠命令 |
 | `install_wb_ops.py` | 一键安装 / 更新 / 卸载 / 状态 / 清理（脚本方式） |
 | `build.sh` | 重新编译原生裁剪器（改 `src/trim.cpp` 后） |
-| `test_*.py` | 测试：一致性 61 + hook 31 + 报告 115 + 稳定性 274 |
+| `test_*.py` | 测试：一致性 66 + hook 34 + 报告 115 + 稳定性 275 |
 | `docs/` | 机制调研、设计文档与测试报告 |
 
 ## 开发
@@ -205,7 +217,7 @@ WB_OPS_CTX_GUARD=off      # 关闭守卫
 # 编译（改 plugins/wb-ops/src/trim.cpp 后；需要 MSYS2 MinGW-w64）
 bash build.sh
 
-# 测试（520 项）
+# 测试（490 项）
 python test_hook.py && python test_parity.py && python test_stability.py && python test_report.py
 ```
 

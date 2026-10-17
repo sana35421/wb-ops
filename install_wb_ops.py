@@ -17,7 +17,9 @@ WorkBuddy 通过三个注册表文件管理插件，本脚本按它们的实际�
     python install_wb_ops.py status     查看当前状态
     python install_wb_ops.py gc         清理旧版本安装快照（默认只预演，加 --yes 执行）
 
-可选参数：--marketplace NAME   自定义市场名（默认 local；卸载 / status / gc 须用同一名字）
+可选参数：
+    --marketplace NAME   自定义市场名（默认 local；卸载 / status / gc 须用同一名字）
+    --with-read          把 Read 写进 PostToolUse matcher（默认不启用；仍需设 WB_OPS_READ_TRIM=1）
 """
 
 import json
@@ -60,8 +62,12 @@ PLUGINS = os.path.join(WB, "plugins")
 MARKETPLACE = "local"   # 市场名；可用 --marketplace NAME 覆盖
 PLUGIN = "wb-ops"
 PLUGIN_ID = "%s@%s" % (PLUGIN, MARKETPLACE)
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BACKUP_SUFFIX = ".bak-2026-10-15-wbops"
+
+# PostToolUse matcher（v1.1 收紧，详见 apply_read_matcher 的说明）
+MATCHER_DEFAULT = "Grep|Glob|WebFetch"
+MATCHER_WITH_READ = "Grep|Glob|WebFetch|Read"
 
 MARKET_DIR = os.path.join(PLUGINS, "marketplaces", MARKETPLACE)
 PLUGIN_DIR = os.path.join(MARKET_DIR, "plugins", PLUGIN)
@@ -126,6 +132,43 @@ def write_json(path, data, backup=True):
         f.write("\n")
 
 
+def want_read():
+    """是否把 Read 装进 PostToolUse matcher（`--with-read`）。"""
+    return "--with-read" in sys.argv
+
+
+def apply_read_matcher(*roots):
+    """v1.1：`--with-read` 时把已落盘的 hooks.json 的 PostToolUse matcher 扩到含 Read。
+
+    默认 matcher 只有 Grep|Glob|WebFetch，理由：
+      · Bash 摘除 —— 宿主对 Bash 的 tool_response 只给元数据（exitCode 等），
+        正文不在载荷里，hook 拿不到任何可裁剪文本，命中一次只白付约 270ms 进程开销
+        （实测 bash+exe 273ms/次 vs 裸 exe 64ms/次）。
+      · Read 摘除 —— Read 裁剪默认关闭（要 WB_OPS_READ_TRIM=1 才生效），
+        为默认关闭的功能在每次读文件时白付 270ms 不划算，改为安装期显式开启；
+        开启后仍受 >1500 行门槛保护。
+    """
+    for root in roots:
+        path = os.path.join(root, "hooks", "hooks.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            hit = 0
+            for group in data.get("hooks", {}).get("PostToolUse", []):
+                if group.get("matcher") == MATCHER_DEFAULT:
+                    group["matcher"] = MATCHER_WITH_READ
+                    hit += 1
+            if not hit:
+                print("  ! %s 的 matcher 不是默认值，未改动" % path)
+                continue
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            print("  + matcher -> %s（还需设 WB_OPS_READ_TRIM=1 才真正裁剪）" % MATCHER_WITH_READ)
+        except Exception as e:
+            print("  ! 修改 matcher 失败（%s）：%s" % (path, e))
+
+
 def sync():
     """把插件源目录（PLUGIN_SRC）的当前内容同步进市场副本和安装快照。
 
@@ -155,6 +198,8 @@ def sync():
     print("  + 市场副本 %s" % PLUGIN_DIR)
 
     shutil.copytree(PLUGIN_SRC, CACHE_DIR, ignore=SYNC_IGNORE, dirs_exist_ok=True)
+    if want_read():
+        apply_read_matcher(PLUGIN_DIR, CACHE_DIR)
     if write_marketplace_manifest():
         print("  + 市场清单 %s" % os.path.join(MARKET_DIR, ".codebuddy-plugin", "marketplace.json"))
     print("  + 安装快照 %s" % CACHE_DIR)
@@ -272,6 +317,8 @@ def install():
         shutil.rmtree(CACHE_DIR)
     os.makedirs(CACHE_DIR, exist_ok=True)
     shutil.copytree(PLUGIN_DIR, CACHE_DIR, dirs_exist_ok=True)
+    if want_read():
+        apply_read_matcher(PLUGIN_DIR, CACHE_DIR)
     print("  + %s" % CACHE_DIR)
 
     # ---- 3. 记录安装 ----
@@ -476,9 +523,9 @@ def apply_marketplace(argv):
 if __name__ == "__main__":
     rest = apply_marketplace(sys.argv[1:])
     cmd = next((a for a in rest if not a.startswith("-")), "install")
-    unknown = [a for a in rest if a.startswith("-") and a != "--yes"]
+    unknown = [a for a in rest if a.startswith("-") and a not in ("--yes", "--with-read")]
     if unknown:
-        print("未知参数：%s（可用：--marketplace NAME / --yes）" % " ".join(unknown))
+        print("未知参数：%s（可用：--marketplace NAME / --yes / --with-read）" % " ".join(unknown))
         sys.exit(2)
     if cmd == "install":
         sys.exit(install())

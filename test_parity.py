@@ -172,9 +172,11 @@ def build_cases():
     lc[2] = "CRITICAL ERROR: boom"
     cases.append(("关键字全在显示区（文案）", "Grep", lc))
 
-    # 29. S1 文案：预算截断（捞回 3 条 < 全文命中 4 条）—— 应补「共命中 4 条」
+    # 29. S1 文案：预算截断（捞回 K 条 < 全文命中 M 条）—— 应补「共命中 M 条」
+    # v1.1 头尾自适应后单靠行长撑不满预算，改用 6 条关键字行撑爆捞回区
     lb = ["L%03d %s" % (i, "x" * 245) for i in range(1, 201)]
-    for k, tag in ((44, "A"), (45, "B"), (46, "C"), (47, "D")):
+    for k in (44, 60, 80, 100, 120, 140):
+        tag = chr(65 + (44, 60, 80, 100, 120, 140).index(k))
         lb[k] = "ERROR budget-cut %s " % tag + tag.lower() * 1100
     cases.append(("预算截断：共命中提示", "Grep", lb))
 
@@ -341,15 +343,17 @@ def test_stats_parity():
                    env=dict(os.environ, WB_OPS_STATS="0", WB_OPS_STATS_DIR=d_off))
     checks.append(("WB_OPS_STATS=0 不写", read_lines(d_off) == []))
 
-    # 边界：无 session_id -> s 为空串
+    # 边界：无 session_id -> v1.1 起不入账（无法归属会话，视为探头）
     p2 = json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Grep",
                      "tool_response": ["x%d" % i for i in range(300)]}).encode("utf-8")
     d_no = tempfile.mkdtemp(prefix="wbops-stats-nosid-")
     subprocess.run([EXE], input=p2, capture_output=True,
                    env=dict(os.environ, WB_OPS_STATS_DIR=d_no))
-    l_no = read_lines(d_no)
-    checks.append(("无 session_id -> s 为空串",
-                   len(l_no) == 1 and json.loads(l_no[0])["s"] == ""))
+    d_no_py = tempfile.mkdtemp(prefix="wbops-stats-nosid-py-")
+    subprocess.run([PYTHON, PY_SCRIPT], input=p2, capture_output=True,
+                   env=dict(os.environ, WB_OPS_STATS_DIR=d_no_py))
+    checks.append(("无 session_id -> 不入账（双实现一致）",
+                   read_lines(d_no) == [] and read_lines(d_no_py) == []))
 
     # 边界：短输出（不裁剪）不记账
     p3 = json.dumps({"hook_event_name": "PostToolUse", "session_id": "zzzz0000-1111",
@@ -563,7 +567,7 @@ def main():
                     "关键字行已包含在显示区域" in n_ex and "未发现" not in n_ex):
                 assert_fail += 1
                 print("        !! 显示区文案不正确")
-            if name == "预算截断：共命中提示" and "共命中 4 条" not in n_ex:
+            if name == "预算截断：共命中提示" and "共命中 6 条" not in n_ex:
                 assert_fail += 1
                 print("        !! 未给出「共命中 M 条」的预算截断提示")
             if name == "Bash bool 退出码（不视为退出码）" and "[exit code" in n_ex:

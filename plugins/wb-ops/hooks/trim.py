@@ -32,8 +32,6 @@ from datetime import datetime
 # 上下文成本量级一致；按码点计会被中文内容绕过上界（1 个汉字 ≈ 3 字节 ≈ 1 token）。
 MAX_LINES = 120         # 行数超过这个才裁（触发条件）
 MAX_BYTES = 8000        # 默认预算：字节数超过这个才裁（触发条件），也是结果硬上界
-HEAD_LINES = 50         # 开头区域最多看多少行
-TAIL_LINES = 25         # 结尾区域最多看多少行
 MAX_KEY_LINES = 40      # 中间区域最多捞回多少条关键行（超出则均匀抽样）
 MIN_LINE_BYTES = 60     # 截断展示时单行至少保留的字节数，低于此值整行丢弃
 MAX_LINE_BYTES = 1000   # 单行最多展示的字节数（防 minified 超长行吃掉预算）
@@ -45,10 +43,27 @@ BUDGET_CAP = 131072     # 允许的最大预算（再大等于放弃裁剪）
 MAX_INPUT = 8 * 1024 * 1024   # v0.6.1：stdin 读取上限（读取时即生效，超限透传）
 MAX_FILL_ROUNDS = 4     # v0.6.1（S1）：捞回候选迭代填充轮数上限（双实现一致，保 parity）
 
+# ---- v1.1：头尾行数按「平均行长」自适应，并向预算扩张 ----
+# 旧版固定头 50 / 尾 25 行：短行输出（日志、文件清单）只能用到预算的 5~6 成，
+# 长行输出又可能一段就吃满。改为「先按平均行长估一个头尾行数，
+# 再用「未达标就放大头尾」的扩张循环把预算填到 FILL_TARGET_PCT」，两端都自适应。
+HEAD_PCT = 30           # 头段初始按预算的这个百分比估行数
+TAIL_PCT = 22           # 尾段初始按预算的这个百分比估行数
+HEAD_MIN, HEAD_MAX = 8, 400      # 普通工具头段行数夹紧区间
+TAIL_MIN, TAIL_MAX = 5, 300      # 普通工具尾段行数夹紧区间
+READ_HEAD_MIN, READ_HEAD_MAX = 20, 400   # Read 模式头段
+READ_TAIL_MIN, READ_TAIL_MAX = 10, 300   # Read 模式尾段
+GROW_ROUNDS = 6         # 预算扩张轮数上限（每轮头尾各 ×1.25）
+FILL_TARGET_PCT = 85    # 预算利用率目标：低于这个就放大头尾，达到就停（不追求打满：
+                        # 打满会为凑字节塞入价值低的整段行，token 反而更贵）
+
+# 幂等护栏：输出里已带本插件标记，说明这段文本裁剪过，不再二次裁剪
+MARK_OMIT = "[wb-ops 省略"
+MARK_TAIL = "[wb-ops 以下为原文末尾"
+
 # ---- v0.6.9：Read 按需裁剪（默认关闭）----
 READ_MIN_LINES = 1500   # Read 小于这么多行一律不裁（源码要完整读）
-READ_HEAD_LINES = 200   # Read 头段行数
-READ_TAIL_LINES = 120   # Read 尾段行数
+# v1.1：Read 的头尾行数也走自适应（见 READ_HEAD_MIN/READ_HEAD_MAX 等）
 
 # Read 模式下的「符号行」：函数 / 类 / 结构 / 导入等骨架行
 # （全是字面量，用子串匹配，与 src/trim.cpp 的 SYMBOLS 逐项一致，保 parity）
@@ -65,10 +80,10 @@ def env_flag(name):
     return (os.environ.get(name) or "").strip(" \t\r\n\v\f") == "1"
 
 
-def bash_failed(text):
-    """Bash 失败透传：宿主给 Bash 的是纯文本「… / Exit Code: N / Signal: …」，
-    命令失败时整段输出都可能有用，不裁剪。只认文本里的 "Exit Code: N"；
-    结构化对象（带 exitCode 字段）仍按原逻辑裁剪并补退出码。
+def text_failed(text):
+    """文本形态的失败信号：宿主给 Bash 的纯文本里带「Exit Code: N」且 N != 0。
+
+    命令失败时整段输出都可能有用，不裁剪。
     """
     key = "Exit Code:"
     p = text.rfind(key)
@@ -76,6 +91,53 @@ def bash_failed(text):
         return False
     m = re.match(r"[ \t]*(-?[0-9]+)", text[p + len(key):p + len(key) + 24])
     return bool(m) and int(m.group(1)) != 0
+
+
+def _nonzero_int(value):
+    """非 bool 的整数值且非 0（与 src/trim.cpp 的 same 判定一致）。"""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and value == value and value not in (float("inf"), float("-inf"))
+            and value != 0)
+
+
+def resp_failed(resp):
+    """v1.1（P0-2）：结构化失败判定。
+
+    宿主在 tool_response 里给了权威字段，不能再靠猜正文：
+      is_error / isError 为真           —— 宿主自己打的失败标
+      exitCode / exit_code 非 0         —— Bash / 命令类工具
+      tool_error_code 不是 "0"/"Success" —— 宿主工具错误码（"0" 表示成功）
+      error 非空字符串                   —— 兜底
+    失败一律整段透传：报错现场被裁掉比多花几百 token 贵得多。
+    """
+    if not isinstance(resp, dict):
+        return False
+    for key in ("is_error", "isError"):
+        value = resp.get(key)
+        if value is True or _nonzero_int(value):
+            return True
+    if _nonzero_int(resp.get("exitCode", resp.get("exit_code"))):
+        return True
+    code = resp.get("tool_error_code", resp.get("toolErrorCode"))
+    if isinstance(code, str) and code.strip() not in ("", "0", "Success", "success"):
+        return True
+    err = resp.get("error")
+    if isinstance(err, str) and err.strip():
+        return True
+    return False
+
+
+def looks_json(text):
+    """粗判原文是 JSON 结构（两端括号）。两实现同构，不做真正的解析。
+
+    用途：裁剪后必然不再是合法 JSON，在标记里点明一句，免得模型拿去 json.loads 白跑。
+    """
+    s = text.strip(" \t\r\n")
+    if len(s) < 2:
+        return False
+    if not ((s[0] == "{" and s[-1] == "}") or (s[0] == "[" and s[-1] == "]")):
+        return False
+    return True
 
 
 def resolve_budget():
@@ -135,6 +197,10 @@ def stats(tool, sid, before, after):
     """
     try:
         if os.environ.get("WB_OPS_STATS") == "0":
+            return
+        # v1.1（P2）：只记真实会话。测试/基准探头没有 session_id 或带探针前缀，
+        # 混进账本会把报表口径带偏（0.6.9 的账本里就混着 7 条测试产物）。
+        if not sid or sid[:5] in ("test", "bench", "probe", "demo", "sampl"):
             return
         base = os.environ.get("WB_OPS_STATS_DIR")
         if not base:
@@ -273,8 +339,10 @@ def trim(text, read_mode=False):
     total = len(lines)
     tbytes = blen(text)
     budget_bytes = resolve_budget()   # v0.3.5：可用 WB_OPS_BUDGET 覆盖（默认 8000）
-    head_n = READ_HEAD_LINES if read_mode else HEAD_LINES
-    tail_n = READ_TAIL_LINES if read_mode else TAIL_LINES
+
+    # v1.1：已带本插件标记的文本不再二次裁剪（幂等，免得越裁越碎）
+    if MARK_OMIT in text or MARK_TAIL in text:
+        return None
 
     # 触发条件：普通工具「行数 > 120 或字节 > 预算」；Read 只认长文件（行数 > 1500 且字节超预算）
     if not read_mode:
@@ -283,18 +351,33 @@ def trim(text, read_mode=False):
     elif total <= READ_MIN_LINES or tbytes <= budget_bytes:
         return None
 
+    # v1.1：头尾行数按平均行长估，再在下面按预算扩张
+    avg = tbytes // total if total > 0 else 1
+    if avg < 1:
+        avg = 1
+    if read_mode:
+        head_lo, head_hi, tail_lo, tail_hi = READ_HEAD_MIN, READ_HEAD_MAX, READ_TAIL_MIN, READ_TAIL_MAX
+    else:
+        head_lo, head_hi, tail_lo, tail_hi = HEAD_MIN, HEAD_MAX, TAIL_MIN, TAIL_MAX
+    head_n = min(max((budget_bytes - MARKER_RESERVE) * HEAD_PCT // 100 // avg, head_lo), head_hi)
+    tail_n = min(max((budget_bytes - MARKER_RESERVE) * TAIL_PCT // 100 // avg, tail_lo), tail_hi)
+    # 头尾不能盖满全文：留出至少 6 行当「中段」
+    side_max = (total - 6) // 2
+    if side_max < 1:
+        side_max = 1
+    head_n = min(head_n, side_max)
+    tail_n = min(tail_n, side_max)
+
     if total <= head_n + tail_n + 5:
         # 行数少但字节多（超长单行），按字节截首尾（额度随预算等比缩放；默认 8000 -> 5000/2400）
         lh = budget_bytes * 5 // 8
         lt = budget_bytes * 3 // 10
         head = u8_prefix(text, lh)
         tail = u8_suffix(text, lt)
-        return "%s\n… [wb-ops 省略 %d 字节] …\n%s" % (
-            head, tbytes - blen(head) - blen(tail), tail)
-
-    head = lines[:head_n]
-    tail = lines[total - tail_n:]
-    mid_lo, mid_hi = head_n, total - tail_n
+        marker = "… [wb-ops 省略 %d 字节] …" % (tbytes - blen(head) - blen(tail))
+        if looks_json(text):
+            marker += "\n… [wb-ops 注：原文为 JSON 结构，截断后已非合法 JSON] …"
+        return "%s\n%s\n%s" % (head, marker, tail)
 
     # 命中统计（全文一次预计算，供候选集与标记文案复用）
     # 普通模式认 error/warning 等关键字；Read 模式认函数/类/import 等符号行
@@ -302,45 +385,69 @@ def trim(text, read_mode=False):
     is_key = [bool(hit(line)) for line in lines]
     hit_total = sum(is_key)   # 全文命中总数 M（标记文案用）
 
-    # 初始候选：中段全部命中行（原捞回域）
-    key_idx = [i for i in range(mid_lo, mid_hi) if is_key[i]]
-
     budget = budget_bytes - MARKER_RESERVE
-    head_shown, key_shown, tail_shown = [], [], []
-    cand_idx, sampled, pool_n = [], False, 0
-    for _ in range(MAX_FILL_ROUNDS):
-        # 候选超过捞出上限时按固定步长均匀抽样（覆盖全局，而非只看前 40 条）
-        pool_n = len(key_idx)
-        if pool_n > MAX_KEY_LINES:
-            sampled = True
-            step = (pool_n + MAX_KEY_LINES - 1) // MAX_KEY_LINES  # 向上取整
-            cand_idx = key_idx[::step]
-        else:
-            sampled = False
-            cand_idx = key_idx
 
+    # ---- v1.1：预算扩张。头尾行数按平均行长估出来后，
+    # 若填充没用到 FILL_TARGET_PCT 预算，就放大头尾再来一轮（最多 GROW_ROUNDS 轮）；
+    # 取「用掉预算最多」的那一轮。两端实现同一循环，保 parity。
+    best = None
+    for _grow in range(GROW_ROUNDS + 1):
+        head = lines[:head_n]
+        tail = lines[total - tail_n:]
+        mid_lo, mid_hi = head_n, total - tail_n
+
+        # 初始候选：中段全部命中行（原捞回域）
+        key_idx = [i for i in range(mid_lo, mid_hi) if is_key[i]]
+
+        head_shown, key_shown, tail_shown = [], [], []
+        cand_idx, sampled, pool_n = [], False, 0
         used = 0
-        head_shown, used = fill_lines(head, budget * 40 // 100, used)
-        key_shown, used = fill_lines([lines[i] for i in cand_idx],
-                                     budget * 70 // 100, used)
-        tail_rev, used = fill_lines(list(reversed(tail)), budget, used)
-        tail_shown = list(reversed(tail_rev))
+        for _ in range(MAX_FILL_ROUNDS):
+            # 候选超过捞出上限时按固定步长均匀抽样（覆盖全局，而非只看前 40 条）
+            pool_n = len(key_idx)
+            if pool_n > MAX_KEY_LINES:
+                sampled = True
+                step = (pool_n + MAX_KEY_LINES - 1) // MAX_KEY_LINES  # 向上取整
+                cand_idx = key_idx[::step]
+            else:
+                sampled = False
+                cand_idx = key_idx
 
-        # 本轮的显示行索引集合
-        shown = set(range(len(head_shown)))
-        shown.update(cand_idx[:len(key_shown)])
-        shown.update(range(total - len(tail_shown), total))
+            used = 0
+            head_shown, used = fill_lines(head, budget * 40 // 100, used)
+            key_shown, used = fill_lines([lines[i] for i in cand_idx],
+                                         budget * 70 // 100, used)
+            tail_rev, used = fill_lines(list(reversed(tail)), budget, used)
+            tail_shown = list(reversed(tail_rev))
 
-        # 新一轮候选：中段全部命中行 + 头/尾段「未被本段填中」的命中行（原文顺序）
-        new_idx = []
-        for i in range(total):
-            if not is_key[i]:
-                continue
-            if mid_lo <= i < mid_hi or i not in shown:
-                new_idx.append(i)
-        if new_idx == key_idx:   # 候选已稳定：本轮填充即最终结果
+            # 本轮的显示行索引集合
+            shown = set(range(len(head_shown)))
+            shown.update(cand_idx[:len(key_shown)])
+            shown.update(range(total - len(tail_shown), total))
+
+            # 新一轮候选：中段全部命中行 + 头/尾段「未被本段填中」的命中行（原文顺序）
+            new_idx = []
+            for i in range(total):
+                if not is_key[i]:
+                    continue
+                if mid_lo <= i < mid_hi or i not in shown:
+                    new_idx.append(i)
+            if new_idx == key_idx:   # 候选已稳定：本轮填充即最终结果
+                break
+            key_idx = new_idx
+
+        if best is None or used > best[0]:
+            best = (used, head_shown, key_shown, tail_shown, cand_idx,
+                    sampled, pool_n, shown)
+        if used * 100 >= budget * FILL_TARGET_PCT:   # 预算用够了，收工
             break
-        key_idx = new_idx
+        next_head = min(head_n * 5 // 4 + 1, side_max)
+        next_tail = min(tail_n * 5 // 4 + 1, side_max)
+        if next_head == head_n and next_tail == tail_n:   # 顶到上限，再放大也没用
+            break
+        head_n, tail_n = next_head, next_tail
+
+    _used, head_shown, key_shown, tail_shown, cand_idx, sampled, pool_n, shown = best
 
     shown_count = len(head_shown) + len(key_shown) + len(tail_shown)
     silent = total - shown_count
@@ -372,6 +479,9 @@ def trim(text, read_mode=False):
                      % (silent, rng_lo, rng_hi,
                         "函数/类/import 行" if read_mode else "error/warning 关键字"))
     parts.extend(key_shown)
+    if looks_json(text):
+        # P1-2：行导向裁剪后必然不是合法 JSON，明说一句，省得模型拿去 json.loads 白跑
+        parts.append("… [wb-ops 注：原文为 JSON 结构，截断后已非合法 JSON] …")
     if tail_shown:
         parts.append("… [wb-ops 以下为原文末尾 %d 行（第 %d–%d 行）] …"
                      % (len(tail_shown), total - len(tail_shown) + 1, total))
@@ -451,12 +561,15 @@ def main():
 
     try:
         tool = data.get("tool_name")
+        resp = data.get("tool_response")
         read_mode = tool == "Read" and env_flag("WB_OPS_READ_TRIM")
         if tool == "Read" and not read_mode:
             trace("Read 未开启按需裁剪（WB_OPS_READ_TRIM!=1），透传")
             return
-        if tool == "Bash" and bash_failed(text):
-            trace("Bash 退出码非 0，保留完整输出，透传")
+        # v1.1（P0-2）：失败一律整段透传。结构化字段优先（is_error / exitCode /
+        # tool_error_code / error），再兜文本里的「Exit Code: N」。
+        if resp_failed(resp) or text_failed(text):
+            trace("工具 %s 失败（结构化或文本信号），保留完整输出，透传" % tool)
             return
         trimmed = trim(text, read_mode)
     except Exception as e:   # 兜底：裁剪出任何意外都静默透传，绝不让 hook 挂住会话

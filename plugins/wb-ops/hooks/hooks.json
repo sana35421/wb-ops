@@ -1,5 +1,5 @@
 {
-  "description": "wb-ops 1.0.0（正式版，行为同 0.6.9；配置项与标记格式自 1.0.0 冻结）: 工具输出压缩（Grep/Glob/WebFetch/Bash，Read 需 WB_OPS_READ_TRIM=1 才启用）+ 记忆守卫（SessionStart 检查用户记忆超限并提醒精简）+ 上下文守卫 v2（UserPromptSubmit：学习各模型真实自动压缩点、三档提醒、压缩后水位检查）+ 压缩指令注入（PreCompact：为压缩摘要注入保留清单）；v0.6.9：PostToolUse matcher 接入 Bash（退出码非 0 时原样透传）与 Read（默认关闭，仅对 >1500 行长文件生效、保留首尾与符号行），省略标记附被省略区间的行号范围。v0.6.8：主动压缩督导的 modules 入口已移除（该 mod 与宿主轮末 Gate 抢跑，会让本轮结果被丢弃、UI 卡在“思考中”），mod/supervisor.mjs 仅归档并需 WB_OPS_COMPACT_UNSAFE=1 才可能压缩。v0.6.6：每条命令在取到插件根后先把 R 里的反斜杠归一化为正斜杠——宿主若注入全反斜杠路径，H 的 /plugins/cache/ 截断不再命中，node 类守卫会静默不执行（0.6.5 测试发现的 D2）。v0.6.5：解释器候选路径改为从插件根推导宿主根（H），不再硬编码某一套宿主的绝对路径——本机并存 WorkBuddy(~/.workbuddy) 与 WorkBuddyAI(~/.workbuddy-ai) 两套宿主，各自 binaries 不同。",
+  "description": "wb-ops 1.1.0: 工具输出压缩（默认 Grep/Glob/WebFetch；Read 需 --with-read 装进 matcher 且 WB_OPS_READ_TRIM=1 才启用）+ 记忆守卫（SessionStart）+ 上下文守卫 v2（UserPromptSubmit）+ 压缩指令注入（PreCompact）。v1.1：PostToolUse matcher 摘掉 Bash —— 宿主 tool_response 对 Bash 只给元数据（exitCode/stdoutBytesTruncated…），正文不在载荷里，hook 无从裁剪，命中一次只白付约 270ms 进程开销（实测 bash+exe 273ms/次、裸 exe 64ms/次）；同轮修复：结构化失败信号（is_error / exitCode≠0 / tool_error_code / error）整段透传、头尾行数改按平均行长自适应并扩张填满预算（利用率 58%→93%+）、裁剪结果含 wb-ops 标记时不再二次裁剪、JSON 原文截断加显式提示、账本过滤无 session_id 与 test/bench/probe 探头记录。v0.6.6：每条命令取到插件根后先把反斜杠归一化为正斜杠（宿主注入全反斜杠路径会让 node 守卫静默不执行）。v0.6.5：解释器候选路径从插件根推导宿主根，不再硬编码。警告：不要再给本文件加 modules 入口——主动压缩督导会与宿主轮末 Gate 抢跑，导致本轮结果被丢弃、UI 永久“思考中”（v0.6.8 已移除，mod/supervisor.mjs 另需 WB_OPS_COMPACT_UNSAFE=1 才可能压缩）。",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -25,7 +25,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Grep|Glob|WebFetch|Bash|Read",
+        "matcher": "Grep|Glob|WebFetch",
         "hooks": [
           {
             "type": "command",

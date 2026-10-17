@@ -64,7 +64,7 @@ tmp = tempfile.mkdtemp(prefix="wbops-selfcheck-")
 home = os.path.join(tmp, "home")
 env = {"WB_OPS_HOST_HOME": home, "WB_OPS_STATS": "0"}
 
-print("自检 1.0.0（临时宿主 %s）" % home.replace(tmp, "<tmp>"))
+print("自检 1.1.0（临时宿主 %s）" % home.replace(tmp, "<tmp>"))
 r = run([PY, os.path.join(ROOT, "install_wb_ops.py"), "install"], env=env)
 ck("install 退出码 0", r.returncode == 0, "rc=%d" % r.returncode)
 
@@ -77,30 +77,43 @@ ck("exe 随快照安装", os.path.isfile(os.path.join(cache, "bin", "wb-ops-trim
 spec = json.load(open(os.path.join(cache, "hooks", "hooks.json"), encoding="utf-8"))
 matcher = spec["hooks"]["PostToolUse"][0]["matcher"]
 command = spec["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
-ck("matcher 覆盖 Grep/Glob/WebFetch/Bash/Read",
-   all(t in matcher.split("|") for t in ("Grep", "Glob", "WebFetch", "Bash", "Read")), matcher)
+# v1.1：默认 matcher 只含 Grep/Glob/WebFetch —— Bash 的 tool_response 只有元数据、
+# Read 默认不裁剪，两者进名单只会每次白付约 270ms 进程开销。
+ck("matcher 默认只含 Grep/Glob/WebFetch",
+   matcher.split("|") == ["Grep", "Glob", "WebFetch"], matcher)
 ck("无 modules 入口（不加载压缩督导）", "modules" not in spec["hooks"])
 
+# Bash 真实载荷形态：只有元数据，没有正文 → hook 无从裁剪，透传
 t = bash_out(600, 0)
-out = hook_run(command, cache, "Bash", t)
-tt = trimmed(out.stdout)
-ck("Bash 成功输出被裁剪", tt is not None and "wb-ops 省略" in tt,
-   "%d -> %d 字节" % (len(t.encode()), len(tt.encode()) if tt else 0))
-
-tf = bash_out(600, 1)
-out = hook_run(command, cache, "Bash", tf)
-ck("Bash 失败整段透传", out.stdout == b"")
+bash_meta = {"exitCode": 0, "signal": None, "stdoutBytesTruncated": False,
+             "tool_error_code": "0"}
+ck("Bash 元数据载荷透传（正文不在载荷里）",
+   hook_run(command, cache, "Bash", bash_meta).stdout == b"")
 
 grep_text = "\n".join("src/a.c:%d: matched content here" % i for i in range(600))
 tt = trimmed(hook_run(command, cache, "Grep", grep_text).stdout)
-ck("Grep 输出被裁剪", tt is not None and "wb-ops 省略" in tt)
+ck("Grep 输出被裁剪", tt is not None and "wb-ops 省略" in tt,
+   "%d -> %d 字节" % (len(grep_text.encode()), len(tt.encode()) if tt else 0))
+
+# v1.1（P0-2）：结构化失败信号 → 整段透传（报错现场优先于省字节）
+for label, resp in (
+    ("is_error", {"stdout": grep_text, "is_error": True}),
+    ("exitCode=2", {"stdout": grep_text, "exitCode": 2}),
+    ("tool_error_code", {"stdout": grep_text, "tool_error_code": "CommandFailed"}),
+):
+    ck("失败透传（%s）" % label, hook_run(command, cache, "Grep", resp).stdout == b"")
+
+# Bash 纯文本形态（退出码在正文末尾）—— 文本兜底仍生效
+tf = bash_out(600, 1)
+ck("Bash 文本失败信号透传", hook_run(command, cache, "Bash", tf).stdout == b"")
 
 read_text = "\n".join("    body_line_%d = compute(x) + 1" % i for i in range(2000))
 ck("Read 默认透传", hook_run(command, cache, "Read", read_text).stdout == b"")
 tt = trimmed(hook_run(command, cache, "Read", read_text, {"WB_OPS_READ_TRIM": "1"}).stdout)
 ck("Read 开启后裁剪", tt is not None and "wb-ops 省略" in tt)
 
-ck("反斜杠插件根仍可用", hook_run(command, cache.replace("/", "\\"), "Bash", t).stdout != b"")
+ck("反斜杠插件根仍可用",
+   hook_run(command, cache.replace("/", "\\"), "Grep", grep_text).stdout != b"")
 
 outdir = os.path.join(tmp, "rep")
 os.makedirs(outdir)

@@ -20,6 +20,7 @@
 //   export PATH="/d/tool/msys64/mingw64/bin:$PATH"
 //   g++ -O2 -s -static -static-libgcc -static-libstdc++ -o bin/wb-ops-trim.exe src/trim.cpp
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -43,8 +44,6 @@
 // ---------------------------------------------------------------------------
 static const int MAX_LINES = 120;      // 行数超过这个才裁（触发条件）
 static const int MAX_BYTES = 8000;     // 默认预算：字节数超过这个才裁（触发条件），也是结果硬上界
-static const int HEAD_LINES = 50;      // 开头区域最多看多少行
-static const int TAIL_LINES = 25;      // 结尾区域最多看多少行
 static const int MAX_KEY_LINES = 40;   // 中间区域最多捞回多少条关键行（超出则均匀抽样）
 static const int MIN_LINE_BYTES = 60;  // 截断展示时单行至少保留的字节数，低于此值整行丢弃
 static const int MAX_LINE_BYTES = 1000;// 单行最多展示的字节数（防 minified 超长行吃掉预算）
@@ -55,6 +54,20 @@ static const int BUDGET_MIN = 2000;    // 允许的最小预算（再窄内容�
 static const int BUDGET_CAP = 131072;  // 允许的最大预算（再大等于放弃裁剪）
 static const size_t MAX_INPUT = 8 * 1024 * 1024;  // v0.6.1：stdin 读取上限（读取时即生效）
 static const int MAX_FILL_ROUNDS = 4;  // v0.6.1（S1）：捞回候选迭代填充轮数上限（与 trim.py 一致）
+
+// ---- v1.1：头尾行数按「平均行长」自适应，并向预算扩张（与 trim.py 逐项一致）----
+static const int HEAD_PCT = 30;        // 头段初始按预算的这个百分比估行数
+static const int TAIL_PCT = 22;        // 尾段初始按预算的这个百分比估行数
+static const int HEAD_MIN = 8, HEAD_MAX = 400;          // 普通工具头段行数夹紧区间
+static const int TAIL_MIN = 5, TAIL_MAX = 300;          // 普通工具尾段行数夹紧区间
+static const int READ_HEAD_MIN = 20, READ_HEAD_MAX = 400;  // Read 模式头段
+static const int READ_TAIL_MIN = 10, READ_TAIL_MAX = 300;  // Read 模式尾段
+static const int GROW_ROUNDS = 6;      // 预算扩张轮数上限（每轮头尾各 ×1.25）
+static const int FILL_TARGET_PCT = 85; // 预算利用率目标：低于这个就放大头尾，达到就停
+
+// 幂等护栏：输出里已带本插件标记，说明这段文本裁剪过，不再二次裁剪
+static const char *MARK_OMIT = "[wb-ops 省略";
+static const char *MARK_TAIL = "[wb-ops 以下为原文末尾";
 
 // 解析 WB_OPS_BUDGET，得到本次裁剪的字节预算；默认 MAX_BYTES。
 // 纯 ASCII 数字（与 hooks/trim.py 的 resolve_budget 完全一致，parity 有专项用例）：
@@ -137,10 +150,9 @@ static bool env_flag(const char *name) {
     return b - a == 1 && s[a] == '1';
 }
 
-// Bash 失败透传：宿主给 Bash 的是纯文本「Command: … / Stdout: … / Exit Code: N / Signal: …」，
+// 文本形态的失败信号：Bash 纯文本里的「Exit Code: N」且 N != 0。
 // 命令失败时整段输出都可能有用（编译器错误上下文），不做裁剪。
-// 只认文本里的 "Exit Code: N"；结构化对象（带 exitCode 字段）仍按原逻辑裁剪并补退出码。
-static bool bash_failed(const std::string &text) {
+static bool text_failed(const std::string &text) {
     const std::string key = "Exit Code:";
     size_t p = text.rfind(key);
     if (p == std::string::npos) return false;
@@ -158,6 +170,29 @@ static bool bash_failed(const std::string &text) {
     }
     if (!any) return false;
     return neg ? v != 0 : v != 0;
+}
+
+// v1.1（P0-2）：结构化失败判定 —— 宿主在 tool_response 里给了权威字段，不能再靠猜正文。
+//   is_error / isError 为真            —— 宿主自己打的失败标
+//   exitCode / exit_code 非 0          —— Bash / 命令类工具
+//   tool_error_code 不是 "0"/"Success" —— 宿主工具错误码（"0" 表示成功）
+//   error 非空字符串                    —— 兜底
+// 与 trim.py 的 resp_failed 同构；失败一律整段透传。
+static bool num_nonzero(double dn) {
+    // 非 0 且有限（NaN/inf 不算失败信号，与 Python 侧一致）
+    if (!std::isfinite(dn)) return false;
+    return dn != 0;
+}
+
+// 粗判原文是 JSON 结构（两端括号）。与 trim.py 的 looks_json 同构，不做真正的解析。
+static bool looks_json(const std::string &text) {
+    const std::string ws = " \t\r\n";
+    size_t a = 0, b = text.size();
+    while (a < b && ws.find(text[a]) != std::string::npos) a++;
+    while (b > a && ws.find(text[b - 1]) != std::string::npos) b--;
+    if (b - a < 2) return false;
+    char f = text[a], l = text[b - 1];
+    return (f == '{' && l == '}') || (f == '[' && l == ']');
 }
 
 static bool is_key_line(const std::string &line) {
@@ -242,6 +277,12 @@ static void stats(const std::string &tool, const std::string &sid,
                   long long before, long long after) {
     const char *off = getenv("WB_OPS_STATS");
     if (off && strcmp(off, "0") == 0) return;  // 显式关闭
+    // v1.1（P2）：只记真实会话，测试/基准探头（无 session_id 或带探针前缀）不入账本
+    if (sid.empty()) return;
+    static const char *FAKE_PREFIX[] = {"test", "bench", "probe", "demo", "sampl"};
+    for (size_t k = 0; k < 5; k++) {
+        if (sid.compare(0, 5, FAKE_PREFIX[k]) == 0) return;
+    }
     try {
         const char *dir = getenv("WB_OPS_STATS_DIR");
         std::string base = (dir && *dir) ? dir : "";
@@ -297,6 +338,40 @@ struct JVal {
         return NULL;
     }
 };
+
+// v1.1（P0-2）：结构化失败判定 —— 宿主在 tool_response 里给了权威字段，不能再靠猜正文。
+//   is_error / isError 为真            —— 宿主自己打的失败标
+//   exitCode / exit_code 非 0          —— Bash / 命令类工具
+//   tool_error_code 不是 "0"/"Success" —— 宿主工具错误码（"0" 表示成功）
+//   error 非空字符串                    —— 兜底
+// 与 trim.py 的 resp_failed 同构；失败一律整段透传。
+static bool resp_failed(const JVal *resp) {
+    if (!resp || resp->t != JVal::OBJ) return false;
+    static const char *FLAGS[] = {"is_error", "isError"};
+    for (size_t k = 0; k < 2; k++) {
+        const JVal *v = resp->get(FLAGS[k]);
+        if (!v) continue;
+        if (v->t == JVal::BOOL && v->b) return true;
+        if (v->t == JVal::NUM && num_nonzero(v->num)) return true;
+    }
+    const JVal *code = resp->get("exitCode");
+    if (!code) code = resp->get("exit_code");
+    if (code && code->t == JVal::NUM && num_nonzero(code->num)) return true;
+    const JVal *tec = resp->get("tool_error_code");
+    if (!tec) tec = resp->get("toolErrorCode");
+    if (tec && tec->t == JVal::STR) {
+        std::string s = tec->s;
+        const std::string ws = " \t\r\n\v\f";
+        size_t a = 0, b = s.size();
+        while (a < b && ws.find(s[a]) != std::string::npos) a++;
+        while (b > a && ws.find(s[b - 1]) != std::string::npos) b--;
+        s = s.substr(a, b - a);
+        if (!s.empty() && s != "0" && s != "Success" && s != "success") return true;
+    }
+    const JVal *err = resp->get("error");
+    if (err && err->t == JVal::STR && !err->s.empty()) return true;
+    return false;
+}
 
 static void append_utf8(std::string &o, unsigned cp) {
     if (cp < 0x80) {
@@ -642,6 +717,75 @@ static bool extract_text(const JVal *resp, std::string &out) {
 // v0.6.9：read_mode = true 时按「源码骨架」策略（头 200 + 尾 120 + 符号行），
 // 并把行号区间写进标记（模型可据此 offset 定向回查）。
 // ---------------------------------------------------------------------------
+struct FillPass {
+    size_t used;
+    bool sampled;
+    size_t pool_n;
+    std::vector<std::string> head_shown, key_shown, tail_shown;
+    std::vector<size_t> cand;
+    std::vector<char> shown;
+    FillPass() : used(0), sampled(false), pool_n(0) {}
+};
+
+// 单次填充（对应 trim.py 里 GROW 循环内的填充段）：给定头尾行数，
+// 迭代捞回关键字行直到候选稳定。used 越大说明这一轮吃掉的预算越多。
+static FillPass fill_pass(const std::vector<std::string> &lines, size_t total,
+                          size_t head_n, size_t tail_n, size_t budget,
+                          const std::vector<char> &is_key) {
+    FillPass r;
+    r.shown.assign(total, 0);
+    std::vector<std::string> head(lines.begin(), lines.begin() + head_n);
+    std::vector<std::string> tail(lines.end() - tail_n, lines.end());
+    const size_t mid_lo = head_n;
+    const size_t mid_hi = total - tail_n;
+
+    std::vector<size_t> key_idx;
+    for (size_t i = mid_lo; i < mid_hi; i++) {
+        if (is_key[i]) key_idx.push_back(i);
+    }
+
+    for (int round = 0; round < MAX_FILL_ROUNDS; round++) {
+        // 候选超过捞出上限时按固定步长均匀抽样（覆盖全局，而非只看前 40 条）
+        r.pool_n = key_idx.size();
+        r.sampled = r.pool_n > (size_t)MAX_KEY_LINES;
+        r.cand.clear();
+        if (r.sampled) {
+            size_t step = (r.pool_n + (size_t)MAX_KEY_LINES - 1) / (size_t)MAX_KEY_LINES;
+            for (size_t k = 0; k < r.pool_n; k += step) r.cand.push_back(key_idx[k]);
+        } else {
+            r.cand = key_idx;
+        }
+
+        // ---- 填预算 ----
+        size_t used = 0;
+        r.head_shown = fill_lines(head, budget * 40 / 100, used);
+        std::vector<std::string> key_lines;
+        key_lines.reserve(r.cand.size());
+        for (size_t k = 0; k < r.cand.size(); k++) key_lines.push_back(lines[r.cand[k]]);
+        r.key_shown = fill_lines(key_lines, budget * 70 / 100, used);
+        std::vector<std::string> tail_rev = fill_lines(
+            std::vector<std::string>(tail.rbegin(), tail.rend()), budget, used);
+        r.tail_shown = std::vector<std::string>(tail_rev.rbegin(), tail_rev.rend());
+        r.used = used;
+
+        // 本轮的显示行索引集合
+        std::fill(r.shown.begin(), r.shown.end(), 0);
+        for (size_t k = 0; k < r.head_shown.size(); k++) r.shown[k] = 1;
+        for (size_t k = 0; k < r.key_shown.size() && k < r.cand.size(); k++) r.shown[r.cand[k]] = 1;
+        for (size_t k = 0; k < r.tail_shown.size(); k++) r.shown[total - 1 - k] = 1;
+
+        // 新一轮候选：中段全部命中行 + 头/尾段「未被本段填中」的命中行（原文顺序）
+        std::vector<size_t> new_idx;
+        for (size_t i = 0; i < total; i++) {
+            if (!is_key[i]) continue;
+            if ((i >= mid_lo && i < mid_hi) || !r.shown[i]) new_idx.push_back(i);
+        }
+        if (new_idx == key_idx) break;   // 候选已稳定：本轮填充即最终结果
+        key_idx.swap(new_idx);
+    }
+    return r;
+}
+
 static bool trim_text(const std::string &text, bool read_mode, std::string &out) {
     std::vector<std::string> lines;
     {
@@ -660,8 +804,12 @@ static bool trim_text(const std::string &text, bool read_mode, std::string &out)
     const size_t total = lines.size();
     const size_t tbytes = text.size();
     const size_t budget_bytes = (size_t)resolve_budget();  // v0.3.5：可用 WB_OPS_BUDGET 覆盖
-    const size_t head_n = (size_t)(read_mode ? READ_HEAD_LINES : HEAD_LINES);
-    const size_t tail_n = (size_t)(read_mode ? READ_TAIL_LINES : TAIL_LINES);
+
+    // v1.1：已带本插件标记的文本不再二次裁剪（幂等，免得越裁越碎）
+    if (text.find(MARK_OMIT) != std::string::npos ||
+        text.find(MARK_TAIL) != std::string::npos) {
+        return false;
+    }
 
     // 触发条件：普通工具「行数 > 120 或字节 > 预算」；Read 只认长文件（行数 > 1500 且字节超预算）
     if (!read_mode) {
@@ -670,22 +818,43 @@ static bool trim_text(const std::string &text, bool read_mode, std::string &out)
         if (total <= (size_t)READ_MIN_LINES || tbytes <= budget_bytes) return false;
     }
 
+    // v1.1：头尾行数按平均行长估，再在下面按预算扩张
+    size_t avg = total ? tbytes / total : 1;
+    if (avg < 1) avg = 1;
+    const int head_lo = read_mode ? READ_HEAD_MIN : HEAD_MIN;
+    const int head_hi = read_mode ? READ_HEAD_MAX : HEAD_MAX;
+    const int tail_lo = read_mode ? READ_TAIL_MIN : TAIL_MIN;
+    const int tail_hi = read_mode ? READ_TAIL_MAX : TAIL_MAX;
+    long long base_bytes = (long long)budget_bytes - (long long)MARKER_RESERVE;
+    if (base_bytes < 0) base_bytes = 0;
+    long long hn = base_bytes * HEAD_PCT / 100 / (long long)avg;
+    long long tn = base_bytes * TAIL_PCT / 100 / (long long)avg;
+    if (hn < head_lo) hn = head_lo;
+    if (hn > head_hi) hn = head_hi;
+    if (tn < tail_lo) tn = tail_lo;
+    if (tn > tail_hi) tn = tail_hi;
+    // 头尾不能盖满全文：留出至少 6 行当「中段」
+    long long side_max = ((long long)total - 6) / 2;
+    if (side_max < 1) side_max = 1;
+    if (hn > side_max) hn = side_max;
+    if (tn > side_max) tn = side_max;
+    size_t head_n = (size_t)hn;
+    size_t tail_n = (size_t)tn;
+
     if ((int)total <= (int)(head_n + tail_n + 5)) {
         // 行数少但字节多（超长单行），按字节截首尾（额度随预算等比缩放；默认 8000 -> 5000/2400）
         std::string head = u8_prefix(text, budget_bytes * 5 / 8);
         std::string tail = u8_suffix(text, budget_bytes * 3 / 10);
         long long omitted = (long long)tbytes - (long long)head.size() - (long long)tail.size();
         char buf[128];
-        snprintf(buf, sizeof(buf), "\n… [wb-ops 省略 %lld 字节] …\n", omitted);
-        out = head + buf + tail;
+        snprintf(buf, sizeof(buf), "\n… [wb-ops 省略 %lld 字节] …", omitted);
+        std::string marker = buf;
+        if (looks_json(text)) {
+            marker += "\n… [wb-ops 注：原文为 JSON 结构，截断后已非合法 JSON] …";
+        }
+        out = head + marker + "\n" + tail;
         return true;
     }
-
-    // ---- 选行：开头 / 结尾按行数取；捞回候选迭代填充至稳定（S1）----
-    std::vector<std::string> head(lines.begin(), lines.begin() + head_n);
-    std::vector<std::string> tail(lines.end() - tail_n, lines.end());
-    const size_t mid_lo = head_n;
-    const size_t mid_hi = total - tail_n;
 
     // 命中统计（全文一次预计算，供候选集与标记文案复用）
     // 普通模式认 error/warning 等关键字；Read 模式认函数/类/import 等符号行
@@ -698,56 +867,33 @@ static bool trim_text(const std::string &text, bool read_mode, std::string &out)
         }
     }
 
-    // 初始候选：中段全部命中行（原捞回域）
-    std::vector<size_t> key_idx;
-    for (size_t i = mid_lo; i < mid_hi; i++) {
-        if (is_key[i]) key_idx.push_back(i);
-    }
-
     const size_t budget = budget_bytes - (size_t)MARKER_RESERVE;
-    std::vector<std::string> head_shown, key_shown, tail_shown;
-    std::vector<size_t> cand;
-    std::vector<char> shown(total, 0);   // v0.6.9：提到循环外，供标记计算行号区间
-    bool sampled = false;
-    size_t pool_n = 0;
-    for (int round = 0; round < MAX_FILL_ROUNDS; round++) {
-        // 候选超过捞出上限时按固定步长均匀抽样（覆盖全局，而非只看前 40 条）
-        pool_n = key_idx.size();
-        sampled = pool_n > (size_t)MAX_KEY_LINES;
-        cand.clear();
-        if (sampled) {
-            size_t step = (pool_n + (size_t)MAX_KEY_LINES - 1) / (size_t)MAX_KEY_LINES;  // 向上取整
-            for (size_t k = 0; k < pool_n; k += step) cand.push_back(key_idx[k]);
-        } else {
-            cand = key_idx;
+
+    // ---- v1.1：预算扩张。头尾行数按平均行长估出来后，
+    // 若填充没用到 FILL_TARGET_PCT 预算，就放大头尾再来一轮（最多 GROW_ROUNDS 轮）；
+    // 取「用掉预算最多」的那一轮。与 trim.py 同一循环。
+    FillPass best;
+    bool have_best = false;
+    for (int grow = 0; grow <= GROW_ROUNDS; grow++) {
+        FillPass cur = fill_pass(lines, total, head_n, tail_n, budget, is_key);
+        if (!have_best || cur.used > best.used) {
+            best = cur;
+            have_best = true;
         }
-
-        // ---- 填预算 ----
-        size_t used = 0;
-        head_shown = fill_lines(head, budget * 40 / 100, used);
-        std::vector<std::string> key_lines;
-        key_lines.reserve(cand.size());
-        for (size_t k = 0; k < cand.size(); k++) key_lines.push_back(lines[cand[k]]);
-        key_shown = fill_lines(key_lines, budget * 70 / 100, used);
-        std::vector<std::string> tail_rev = fill_lines(
-            std::vector<std::string>(tail.rbegin(), tail.rend()), budget, used);
-        tail_shown = std::vector<std::string>(tail_rev.rbegin(), tail_rev.rend());
-
-        // 本轮的显示行索引集合（复用外层缓冲，每轮重置）
-        std::fill(shown.begin(), shown.end(), 0);
-        for (size_t k = 0; k < head_shown.size(); k++) shown[k] = 1;
-        for (size_t k = 0; k < key_shown.size() && k < cand.size(); k++) shown[cand[k]] = 1;
-        for (size_t k = 0; k < tail_shown.size(); k++) shown[total - 1 - k] = 1;
-
-        // 新一轮候选：中段全部命中行 + 头/尾段「未被本段填中」的命中行（原文顺序）
-        std::vector<size_t> new_idx;
-        for (size_t i = 0; i < total; i++) {
-            if (!is_key[i]) continue;
-            if ((i >= mid_lo && i < mid_hi) || !shown[i]) new_idx.push_back(i);
-        }
-        if (new_idx == key_idx) break;   // 候选已稳定：本轮填充即最终结果
-        key_idx.swap(new_idx);
+        if (cur.used * 100 >= budget * FILL_TARGET_PCT) break;   // 预算用够了，收工
+        size_t next_head = std::min<size_t>(head_n * 5 / 4 + 1, (size_t)side_max);
+        size_t next_tail = std::min<size_t>(tail_n * 5 / 4 + 1, (size_t)side_max);
+        if (next_head == head_n && next_tail == tail_n) break;   // 顶到上限，再放大也没用
+        head_n = next_head;
+        tail_n = next_tail;
     }
+
+    std::vector<std::string> head_shown = best.head_shown;
+    std::vector<std::string> key_shown = best.key_shown;
+    std::vector<std::string> tail_shown = best.tail_shown;
+    const bool sampled = best.sampled;
+    const size_t pool_n = best.pool_n;
+    std::vector<char> &shown = best.shown;
 
     // ---- 组装（与 trim.py 逐字节一致）----
     const long long shown_n = (long long)head_shown.size() + (long long)key_shown.size() +
@@ -798,6 +944,10 @@ static bool trim_text(const std::string &text, bool read_mode, std::string &out)
         parts.push_back(mbuf);
     }
     parts.insert(parts.end(), key_shown.begin(), key_shown.end());
+    if (looks_json(text)) {
+        // P1-2：行导向裁剪后必然不是合法 JSON，明说一句，省得模型拿去 json.loads 白跑
+        parts.push_back("… [wb-ops 注：原文为 JSON 结构，截断后已非合法 JSON] …");
+    }
     if (!tail_shown.empty()) {
         snprintf(mbuf, sizeof(mbuf), "… [wb-ops 以下为原文末尾 %d 行（第 %lld–%lld 行）] …",
                  (int)tail_shown.size(), (long long)(total - tail_shown.size()) + 1,
@@ -970,8 +1120,8 @@ int main() {
         trace("Read 未开启按需裁剪（WB_OPS_READ_TRIM!=1），透传");
         return 0;
     }
-    if (tool == "Bash" && bash_failed(text)) {
-        trace("Bash 退出码非 0，保留完整输出，透传");
+    if (resp_failed(root.get("tool_response")) || text_failed(text)) {
+        trace(std::string("工具 ") + tool + " 失败（结构化或文本信号），保留完整输出，透传");
         return 0;
     }
     if (!trim_text(text, read_mode, trimmed)) {
