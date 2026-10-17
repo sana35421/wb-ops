@@ -257,3 +257,21 @@
 | gpt 实测（122K 未触发；201.1K emergency；0 次 pre-message） | `~/.workbuddy/projects/*/sess-d-*.jsonl`、`sess-c-*.jsonl`（另一项目） |
 | RPC 调用记录 | `~/.workbuddy/logs/daemon.log`（`configSetPreMessageCompactPct`） |
 | PreCompact hook 契约 / mods | `codebuddy-lite-wb.mjs`：`executePreCompactHooks`、`bootstrapFunctionHookMods` |
+
+---
+
+## 后记（2026-10-17，v1.0.0）：主动压缩督导已移除
+
+本文第六节曾建议「用 function hook mod 在 `turn.complete` 里主动调 `session.compact` 提前压缩」。
+该方案**已实现并验证，随后被完全下线**，理由值得记录，避免后来者重踩：
+
+- **现象**：mod 在 `turn.complete` 里同步抢占后立即 `session.compact({})`，与宿主
+  `handleStreamRunResult` 的轮末 Gate 抢跑 → 宿主判定「压缩插在本轮中间」→ `willRetry=true`
+  且本轮最终结果被 `interceptorGate` 丢弃；而该压缩走 `skipContinue`（不会重跑），
+  重试永不到来 → **UI 永久停在「思考中」，后续消息只入队不派发**，只能重启桌面端。
+- **复现率**：100%（3 次主动压缩 = 3 次卡死）。
+- **现状**：`hooks/hooks.json` 不再有 `modules` 入口，督导脚本仅作归档且带
+  `WB_OPS_COMPACT_UNSAFE=1` 安全闸；产品保留的是**被动侧**能力——`UserPromptSubmit`
+  三档提醒（ctx-guard v2）与 `PreCompact` 保留清单，两者不会与宿主 Gate 竞争。
+- **结论**：宿主侧的压缩时机不应由插件「推」，只能由用户或宿主自己触发；插件该做的是
+  把水位讲清楚、把摘要要点列清楚。

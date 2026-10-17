@@ -34,7 +34,7 @@ PLUGINS = os.path.join(WB, "plugins")
 MARKETPLACE = "local"   # 市场名；可用 --marketplace NAME 覆盖
 PLUGIN = "wb-ops"
 PLUGIN_ID = "%s@%s" % (PLUGIN, MARKETPLACE)
-VERSION = "0.6.9"
+VERSION = "1.0.0"
 BACKUP_SUFFIX = ".bak-2026-10-15-wbops"
 
 MARKET_DIR = os.path.join(PLUGINS, "marketplaces", MARKETPLACE)
