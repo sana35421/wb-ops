@@ -28,7 +28,33 @@ import sys
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
-WB = os.path.join(HOME, ".workbuddy")
+
+# 宿主配置根目录：WorkBuddy 5.8.x 写 ~/.workbuddy，WorkBuddyAI 写 ~/.workbuddy-ai，两者互不相通。
+# 装错一边等于没装——插件不会被扫描，hook 不加载、不报错、账本停更。
+# 判定顺序：WB_OPS_HOST_HOME 显式指定 → plugins/.last_inuse_sweep 最新者 → 退回 ~/.workbuddy。
+HOST_HOMES = [os.path.join(HOME, ".workbuddy-ai"), os.path.join(HOME, ".workbuddy")]
+
+
+def detect_host_home():
+    """返回 (宿主根目录, 判定依据)。"""
+    env = os.environ.get("WB_OPS_HOST_HOME")
+    if env:
+        # 归一化：Git Bash 可能传 C://Users//x//.workbuddy，原样写进注册表会和宿主注入的插件根对不上
+        return os.path.abspath(os.path.expanduser(env.strip())), "WB_OPS_HOST_HOME"
+    best, best_t = None, -1.0
+    for h in HOST_HOMES:
+        if not os.path.isdir(h):
+            continue
+        marker = os.path.join(h, "plugins", ".last_inuse_sweep")
+        t = os.path.getmtime(marker) if os.path.exists(marker) else 0.0
+        if t > best_t:
+            best, best_t = h, t
+    if best:
+        return best, "自动探测（.last_inuse_sweep 最新）"
+    return os.path.join(HOME, ".workbuddy"), "默认"
+
+
+WB, WB_SOURCE = detect_host_home()
 PLUGINS = os.path.join(WB, "plugins")
 
 MARKETPLACE = "local"   # 市场名；可用 --marketplace NAME 覆盖
@@ -78,12 +104,19 @@ def now_iso():
 
 
 def read_json(path):
+    # 全新宿主可能还没有这些注册表文件，按空配置处理即可（首次安装的场景）
+    if not os.path.isfile(path):
+        print("  提示：%s 不存在，按空配置处理" % os.path.basename(path))
+        return {}
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
 def write_json(path, data, backup=True):
-    if backup:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if backup and os.path.exists(path):
         bak = path + BACKUP_SUFFIX
         if not os.path.exists(bak):
             shutil.copy2(path, bak)
@@ -330,6 +363,7 @@ def uninstall():
 def status():
     print("当前状态")
     print("=" * 56)
+    print("  %-8s %s  (%s)" % ("宿主根", WB, WB_SOURCE))
     for path, label in ((KNOWN, "市场注册"), (INSTALLED, "安装记录"), (SETTINGS, "启用开关")):
         try:
             d = read_json(path)

@@ -8,8 +8,9 @@
 
 > **1.0.0 是首个稳定版**：功能与 0.6.9 一致，不引入新行为，只是把已验证的功能集冻结下来。
 > 自本版起冻结对外契约——环境变量、省略标记格式、hook 事件集、数据文件格式、安装布局；
-> 破坏性改动只会在 2.0 出现。装完想自检：`python test_hook.py`（注册与行为）、
-> `python test_parity.py`（C++ 与 Python 双实现逐字节一致）。
+> 破坏性改动只会在 2.0 出现。
+> 装完想自检：`python test_release.py`（在临时宿主里跑完整生命周期，不碰你现有的 WorkBuddy，
+> 十几秒出结果）、`python test_hook.py`（注册与行为）、`python test_parity.py`（双实现逐字节一致）。
 
 ---
 
