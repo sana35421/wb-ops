@@ -22,6 +22,7 @@ wb-ops / 裁剪 hook 的自测
 
 import json
 import glob
+import hashlib
 import os
 import shutil
 import subprocess
@@ -241,9 +242,10 @@ def main():
               % (label, len(resp), len(body), ratio * 100, keep, mark, status))
     print()
 
-    # ---- 用例 1d（v1.2）：hooks.json 的 if 扩展名清单必须与 trim.py 的 DATA_EXTS 同源 ----
-    # 三处（hooks.json / trim.py / trim.cpp）任一漂移，都会出现「hook 不启动」或
-    # 「启动了却按源码档处理」的静默错配，故在此做一次硬校验。
+    # ---- 用例 1d（v1.2，v1.3 扩到二进制）：三处清单同源 + exe 新鲜度 ----
+    # hooks.json 的 if 规则 / hooks/trim.py 的 DATA_EXTS / bin/wb-ops-trim.exe 自报，
+    # 任一漂移都会静默错配：hook 不启动，或启动了却按源码档处理。
+    # 生产实际跑的是 exe，只比源码等于没比；再加一道构建戳抓「改完忘重编译」。
     sys.path.insert(0, os.path.join(PLUGIN, "hooks"))
     import trim as trim_mod
     with open(os.path.join(PLUGIN, "hooks", "hooks.json"), encoding="utf-8") as f:
@@ -260,6 +262,34 @@ def main():
         checks.append(("默认不带 WB_OPS_READ_TRIM",
                        all("WB_OPS_READ_TRIM" not in (h.get("command") or "")
                            for h in read_groups[0].get("hooks", []))))
+
+    # exe 自报清单：二进制里真实生效的那一份，才算生产口径
+    exe = os.path.join(PLUGIN, "bin", "wb-ops-trim.exe")
+    exe_exts = None
+    if os.path.exists(exe):
+        try:
+            r = subprocess.run([exe, "--dump-exts"], capture_output=True, timeout=10)
+            exe_exts = tuple(json.loads(r.stdout.decode("utf-8", "replace")))
+        except Exception:
+            exe_exts = None
+    checks.append(("exe 可执行且自报清单", exe_exts is not None))
+    checks.append(("exe 自报 == DATA_EXTS", exe_exts is not None and exe_exts == trim_mod.DATA_EXTS))
+
+    # 构建戳：build.sh 落盘的源码 sha256 与当前 trim.cpp 一致，才说明二进制是这份源码编的
+    stamp = os.path.join(PLUGIN, "bin", "wb-ops-trim.build.json")
+    src = os.path.join(PLUGIN, "src", "trim.cpp")
+    stamp_src = ""
+    try:
+        with open(stamp, encoding="utf-8") as f:
+            stamp_src = json.load(f).get("src_sha256") or ""
+    except Exception:
+        stamp_src = ""
+    cur_src = ""
+    if os.path.exists(src):
+        with open(src, "rb") as f:
+            cur_src = hashlib.sha256(f.read()).hexdigest()
+    checks.append(("构建戳 == trim.cpp", bool(stamp_src) and stamp_src == cur_src))
+
     # 普通工具那组仍在，且没被顺手塞进 Read
     checks.append(("普通组 matcher 未含 Read",
                    any(g.get("matcher") == "Grep|Glob|WebFetch" for g in post)))
@@ -267,6 +297,8 @@ def main():
         if not good:
             ok = False
         print("[1d] %-28s %s" % (name, "PASS" if good else "FAIL"))
+    if stamp_src != cur_src:
+        print("[1d] 提示：trim.cpp 在 build.sh 之后改动过，跑 ./build.sh 重新编译")
     print()
 
     # ---- 用例 2：小输出应原样透传 ----

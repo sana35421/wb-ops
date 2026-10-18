@@ -9,7 +9,7 @@
     {
       "name": "wb-ops",
       "description": "压缩冗长的工具输出，减少上下文 token 消耗：Grep/Glob/WebFetch 输出按预算自适应裁剪（头尾行数按平均行长估算并扩张填满预算），省略标记附行号区间可 offset 回查；失败输出按结构化信号整段透传，报错现场不被裁掉；Read 默认参与但只裁数据类文件（日志/CSV/清单，靠 hook 配置的 if 条件在 spawn 前判定，源码文件零开销），源码类可装时加 --with-read 开启（1500 行门槛、按符号行）；上下文守卫 v2（学习各模型压缩点 / 三档提醒 / 压缩后检查）+ PreCompact 压缩保留清单；固定地址动态后台，C++/Python 双实现逐字节一致，539 项测试全绿。",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "source": "./plugins/wb-ops",
       "license": "MIT",
       "keywords": [

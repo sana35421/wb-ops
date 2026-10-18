@@ -22,6 +22,7 @@ WorkBuddy 通过三个注册表文件管理插件，本脚本按它们的实际�
     --with-read          Read 从「只裁数据类文件」扩到「所有文件」（数据类默认就裁，源码默认不裁）
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -62,14 +63,16 @@ PLUGINS = os.path.join(WB, "plugins")
 MARKETPLACE = "local"   # 市场名；可用 --marketplace NAME 覆盖
 PLUGIN = "wb-ops"
 PLUGIN_ID = "%s@%s" % (PLUGIN, MARKETPLACE)
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 BACKUP_SUFFIX = ".bak-2026-10-15-wbops"
 
 # PostToolUse 两组（v1.2 起）：普通工具一组，Read 数据类文件一组（带 if 条件）
 MATCHER_DEFAULT = "Grep|Glob|WebFetch"
 READ_MATCHER = "Read"
-# 与 hooks.json 的 if 规则、hooks/trim.py 的 DATA_EXTS、src/trim.cpp 的 DATA_EXTS
-# 必须保持同一份清单：宿主在 spawn 前用这条 glob 判定，命中不了的 Read 零开销
+# 与 hooks.json 的 if 规则、hooks/trim.py 的 DATA_EXTS、src/trim.cpp 的 DATA_EXTS、
+# 以及 bin/wb-ops-trim.exe --dump-exts 自报的清单必须保持同一份
+# （test_hook.py 用例 1d 会硬校验四处一致）：宿主在 spawn 前用这条 glob 判定，
+# 命中不了的 Read 零开销；生产实际跑的是 exe，只比源码等于没比。
 READ_IF_DEFAULT = "Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt})"
 READ_ENV_EXPORT = "export WB_OPS_READ_TRIM=1; "
 
@@ -98,10 +101,94 @@ def _locate_plugin_src():
 
 PLUGIN_SRC = _locate_plugin_src()  # 插件源目录：安装/同步都从这里复制
 
-# 同步时排除：非插件内容 / 备份 / 日志
-SYNC_IGNORE = shutil.ignore_patterns(
+# 发布白名单：只有运行时必需的内容进市场副本与安装快照。
+# 黑名单是「排除已知的开发产物」，新加的报告/基准默认会漏进包；白名单让「进包」变回
+# 一次显式决定——公开仓的 src/ 与构建戳都不该出现在用户机器上。
+PUBLISH_WHITELIST = (
+    ".codebuddy-plugin",  # plugin.json：宿主识别插件的入口
+    "hooks",              # hooks.json + trim.py + 各守卫
+    "commands",           # 斜杠命令
+    "bin",                # 原生裁剪器
+    "report.py",          # /wb-ops:report 与 --serve
+)
+
+# 白名单目录内部仍要排除：非插件内容 / 备份 / 日志
+# 忽略规则既是「不复制什么」，也是「发布副本里该清掉什么」——两处必须共用一份。
+IGNORE_PATTERNS = (
     ".workbuddy", ".git", "__pycache__", "install_wb_ops.py", "*.bak*", "trace.log",
-    "backup", "_*.log")  # backup/ 是开发侧回滚快照；测试日志不随版本分发
+    "*.build.json",  # 构建戳只在仓库侧给 test_hook.py 用，运行期不需要
+    "backup",        # backup/ 是开发侧回滚快照
+    "_*.log",        # 测试日志不随版本分发
+)
+SYNC_IGNORE = shutil.ignore_patterns(*IGNORE_PATTERNS)
+
+
+def is_published(name):
+    """顶层条目是否属于发布面（整目录白名单，按名字精确匹配，不递归放行）。"""
+    return name in PUBLISH_WHITELIST
+
+
+def prune_ignored(dst):
+    """清掉发布副本里命中忽略规则的残留文件/目录，返回删除数量。
+
+    copytree(ignore=...) 只影响「本次复制」，已存在于目标目录的旧文件不会被删；
+    老副本在加入新规则之前就已经拷进过日志，不主动清理就会一路带进新版本快照。
+    """
+    if not os.path.isdir(dst):
+        return 0
+    removed = 0
+    for root, dirs, files in os.walk(dst, topdown=True):
+        for name in list(dirs):
+            if any(fnmatch.fnmatch(name, p) for p in IGNORE_PATTERNS):
+                shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+                dirs.remove(name)
+                removed += 1
+        for name in files:
+            if any(fnmatch.fnmatch(name, p) for p in IGNORE_PATTERNS):
+                try:
+                    os.remove(os.path.join(root, name))
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
+def publish_copy(src, dst):
+    """把插件源按白名单同步到 dst：只拷发布面内容，并删掉 dst 里白名单外的残留。
+
+    增量覆盖（dirs_exist_ok=True）而不是清空重建；但「不在白名单就删」这步不能省，
+    否则旧规则时代拷进副本的多余文件会一直躺在发布目录里。
+    返回 (保留的顶层条目数, 删除的残留项数)。
+    """
+    os.makedirs(dst, exist_ok=True)
+    kept = 0
+    for name in sorted(os.listdir(src)):
+        if not is_published(name):
+            continue
+        s, d = os.path.join(src, name), os.path.join(dst, name)
+        if os.path.isdir(s):
+            shutil.copytree(s, d, ignore=SYNC_IGNORE, dirs_exist_ok=True)
+        elif os.path.isfile(s):
+            shutil.copy2(s, d)
+        else:
+            continue
+        kept += 1
+
+    removed = 0
+    for name in sorted(os.listdir(dst)):
+        if is_published(name):
+            continue
+        p = os.path.join(dst, name)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        removed += 1
+    removed += prune_ignored(dst)
+    return kept, removed
 
 KNOWN = os.path.join(PLUGINS, "known_marketplaces.json")
 INSTALLED = os.path.join(PLUGINS, "installed_plugins.json")
@@ -206,10 +293,11 @@ def sync():
 
     # 发布只增量覆盖，不清空用户目录或旧快照。两处均从插件源目录（PLUGIN_SRC）复制，
     # 避免市场副本内的历史文件被带进新的版本快照。
-    shutil.copytree(PLUGIN_SRC, PLUGIN_DIR, ignore=SYNC_IGNORE, dirs_exist_ok=True)
-    print("  + 市场副本 %s" % PLUGIN_DIR)
+    kept, removed = publish_copy(PLUGIN_SRC, PLUGIN_DIR)
+    print("  + 市场副本 %s（%d 项%s）"
+          % (PLUGIN_DIR, kept, "，清掉残留 %d 项" % removed if removed else ""))
 
-    shutil.copytree(PLUGIN_SRC, CACHE_DIR, ignore=SYNC_IGNORE, dirs_exist_ok=True)
+    kept, removed = publish_copy(PLUGIN_SRC, CACHE_DIR)
     if want_read():
         apply_read_matcher(PLUGIN_DIR, CACHE_DIR)
     if write_marketplace_manifest():
@@ -298,9 +386,9 @@ def install():
     # 从 clone / 解压目录直接运行（插件源目录 ≠ 市场插件目录）时，先把插件本源铺进市场目录；
     # 用户 git clone 后直接 `python install_wb_ops.py` 即可完成安装。
     if os.path.normcase(os.path.abspath(PLUGIN_SRC)) != os.path.normcase(os.path.abspath(PLUGIN_DIR)):
-        os.makedirs(PLUGIN_DIR, exist_ok=True)
-        shutil.copytree(PLUGIN_SRC, PLUGIN_DIR, ignore=SYNC_IGNORE, dirs_exist_ok=True)
-        print("  + 市场插件目录 %s" % PLUGIN_DIR)
+        kept, removed = publish_copy(PLUGIN_SRC, PLUGIN_DIR)
+        print("  + 市场插件目录 %s（%d 项%s）"
+              % (PLUGIN_DIR, kept, "，清掉残留 %d 项" % removed if removed else ""))
 
     if not os.path.isdir(PLUGIN_DIR):
         print("! 插件目录不存在：%s" % PLUGIN_DIR)
@@ -327,8 +415,7 @@ def install():
     print("[2/4] 生成安装快照 cache/%s/%s/%s" % (MARKETPLACE, PLUGIN, VERSION))
     if os.path.isdir(CACHE_DIR):
         shutil.rmtree(CACHE_DIR)
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    shutil.copytree(PLUGIN_DIR, CACHE_DIR, dirs_exist_ok=True)
+    publish_copy(PLUGIN_DIR, CACHE_DIR)
     if want_read():
         apply_read_matcher(PLUGIN_DIR, CACHE_DIR)
     print("  + %s" % CACHE_DIR)

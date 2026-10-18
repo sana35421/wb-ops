@@ -4,8 +4,13 @@
 会话临近自动压缩点之前主动提醒（省心），记忆文件超限时自动收拾（防截断），
 并自带一本"省了多少"的账与可视化报告后台。
 
-当前版本 **1.2.0** ｜ 宿主 WorkBuddy 5.8.2（Windows 实测） ｜ [MIT License](LICENSE)
+当前版本 **1.2.1** ｜ 宿主 WorkBuddy 5.8.2（Windows 实测） ｜ [MIT License](LICENSE)
 
+> **1.2.1 是「发布链加固」版**：① 数据类扩展名清单改成三处同源校验——`bin/wb-ops-trim.exe --dump-exts`
+> 自报二进制里真实生效的那份，`build.sh` 另落构建戳（源码 sha256），改完 `trim.cpp` 忘了重编译会被
+> `test_hook.py` 直接抓到（用哈希而非 mtime，重存文件不会误报）；② 安装/同步改为发布白名单，
+> 只把 `plugin.json` / `hooks` / `commands` / `bin` / `report.py` 装进快照，源码与构建戳留在仓库；
+> ③ 上下文守卫第三档改为「先照常回答当前问题，再建议收尾」，不再建议拒答。
 > **1.2.0 让 Read 也进默认裁剪，但只裁「数据类」文件**：宿主 hook 配置里有个未文档化的 `if` 字段
 > （`Tool(argPattern)` 语法），在 spawn 之前就按 `tool_input.file_path` 做 glob 判定，命不中则 hook
 > 根本不启动。于是给 PostToolUse 加第二组 `matcher=Read` + `if=Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt})`：

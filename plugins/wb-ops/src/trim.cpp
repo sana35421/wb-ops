@@ -17,6 +17,8 @@
 // 先做 isfinite + 范围判断再转整型（X3/X5）；退化输入不比原文小就透传（S9）。
 //
 // 编译（MSYS2 MinGW-w64）：
+//   ./build.sh                      ← 推荐：顺带写 bin/wb-ops-trim.build.json 构建戳
+//   或手动：
 //   export PATH="/d/tool/msys64/mingw64/bin:$PATH"
 //   g++ -O2 -s -static -static-libgcc -static-libstdc++ -o bin/wb-ops-trim.exe src/trim.cpp
 
@@ -1077,7 +1079,32 @@ static std::string brief(const JVal *v) {
 }
 
 // ---------------------------------------------------------------------------
-int main() {
+// v1.3：--dump-exts 打印数据类扩展名清单（JSON 数组），供 test_hook.py 校验
+// 「hooks.json 的 if 规则 / hooks/trim.py 的 DATA_EXTS / 本二进制」三处同源。
+// 生产走的是这个 exe，只比对源码等于没比对——改完清单忘了重编译，自报清单才对得上。
+static void dump_exts() {
+    _setmode(_fileno(stdout), _O_BINARY);
+    std::string out = "[";
+    for (size_t k = 0; k < DATA_EXT_COUNT; k++) {
+        if (k) out += ",";
+        out += "\"";
+        out += DATA_EXTS[k];
+        out += "\"";
+    }
+    out += "]\n";
+    fwrite(out.data(), 1, out.size(), stdout);
+    fflush(stdout);
+}
+
+int main(int argc, char **argv) {
+    // 版本自检通道：不读 stdin、不碰 hook 协议，只回一份清单
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--dump-exts") == 0) {
+            dump_exts();
+            return 0;
+        }
+    }
+
     // 二进制模式：避免 \r\n 转换与 CTRL-Z 截断破坏 JSON
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);

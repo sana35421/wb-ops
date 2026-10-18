@@ -23,3 +23,15 @@ fi
 
 g++ -O2 -s -static -static-libgcc -static-libstdc++ -Wall -o "$PLUGIN/bin/wb-ops-trim.exe" "$PLUGIN/src/trim.cpp"
 echo "编译完成：$PLUGIN/bin/wb-ops-trim.exe（$(stat -c%s "$PLUGIN/bin/wb-ops-trim.exe") 字节）"
+
+# v1.3：记下「这次二进制对应哪份源码」。test_hook.py 用它判断源码改完有没有重编译——
+# 只比对扩展名清单抓不到「改了裁剪逻辑却忘了 build」的静默错位。
+SRC_SHA="$(sha256sum "$PLUGIN/src/trim.cpp" | cut -d' ' -f1)"
+cat > "$PLUGIN/bin/wb-ops-trim.build.json" <<EOF
+{
+  "src_sha256": "$SRC_SHA",
+  "built_at": "$(date -Iseconds)",
+  "exe_bytes": $(stat -c%s "$PLUGIN/bin/wb-ops-trim.exe")
+}
+EOF
+echo "构建戳：$PLUGIN/bin/wb-ops-trim.build.json（src ${SRC_SHA:0:12}）"
