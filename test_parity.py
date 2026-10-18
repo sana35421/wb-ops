@@ -246,6 +246,31 @@ def build_cases():
     cases.append(("Read tool_input.path 键（裁剪）", "Read", "\n".join(log_lines),
                   {}, {"path": "D:/tmp/other.jsonl"}))
 
+    # ---- v1.2.2 新增：结构类 .json 单独一档 ----
+    # 结构类触发条件与日志不同：要「行数 > 800 且字节 > 预算」两项都过线才裁。
+    # 所以 700 行 / 15KB 的配置（字节已超预算）应当透传——旧规则只看字节会误裁。
+    def json_dump(n):
+        """造 n 行、每行约 22 字节的 json 字段（700 行≈15KB，850 行≈19KB）。"""
+        rows = ["{"]
+        for i in range(n):
+            rows.append('  "key_%04d": %d,' % (i, i * 7 + 1))
+        rows.append('  "end": 0')
+        rows.append("}")
+        return "\n".join(rows)
+    # 41. .json 700 行 / ~15KB：字节超预算但行数未过 800 → 透传
+    cases.append(("Read .json 700 行（透传）", "Read", json_dump(700),
+                  {}, {"file_path": "D:/tmp/package-lock.json"}))
+    # 42. .json 850 行 / ~19KB：两项都过线 → 裁剪
+    cases.append(("Read .json 850 行（裁剪）", "Read", json_dump(850),
+                  {}, {"file_path": "D:/tmp/package-lock.json"}))
+    # 43. 对照：日志类仍是 200 行且只看单项，600 行 .log（~28KB）照裁
+    cases.append(("Read .log 600 行（裁剪）", "Read", "\n".join(log_lines[:600]),
+                  {}, {"file_path": "D:/tmp/service.log"}))
+    # 44. 硬阀：行数很少但体量巨大的 dump（30 行 / ~60KB）仍要裁
+    big_rows = ["{"] + ['  "blob": "%s",' % ("x" * 2000) for _ in range(28)] + ["}"]
+    cases.append(("Read .json 30 行超大（硬阀裁剪）", "Read", "\n".join(big_rows),
+                  {}, {"file_path": "D:/tmp/dump.json"}))
+
     return cases
 
 
@@ -570,6 +595,21 @@ def main():
         if not same:
             print("        python -> %s" % (str(n_py)[:160],))
             print("        native -> %s" % (str(n_ex)[:160],))
+
+        # ---- v1.2.2：结构类 .json 门槛 800 行（三条都要在 isinstance 判断之外：
+        #      透传时 n_ex 为 None，放进下面的块里就永远执行不到）----
+        if name == "Read .json 700 行（透传）" and n_ex is not None:
+            assert_fail += 1
+            print("        !! 结构类 700 行被裁了：结构类要行数、字节都过线才裁")
+        if name == "Read .json 850 行（裁剪）" and n_ex is None:
+            assert_fail += 1
+            print("        !! 结构类 850 行未裁剪：800 行门槛失效")
+        if name == "Read .log 600 行（裁剪）" and n_ex is None:
+            assert_fail += 1
+            print("        !! 日志类 600 行未裁剪：日志门槛应保持 200 行")
+        if name == "Read .json 30 行超大（硬阀裁剪）" and n_ex is None:
+            assert_fail += 1
+            print("        !! 超大 dump 未裁剪：40KB 硬阀失效")
 
         # ---- 专项断言：字节上界 / 整行保真 / 关键行捞回 / 抽样覆盖 ----
         if isinstance(n_ex, str):

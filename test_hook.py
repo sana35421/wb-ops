@@ -205,9 +205,25 @@ def main():
     log_text = "\n".join(log_lines)
     src_text = "\n".join(("def f_%d(x):" % i if i % 300 == 0 else "    b_%d = compute(x)" % i)
                          for i in range(2000))
+    # v1.2.2：结构类 .json 要「行数 > 800 且字节 > 预算」两项都过线才裁：
+    #   700 行 / ~15KB → 透传（字节已超预算，旧规则会误裁）
+    #   900 行 / ~20KB → 裁剪
+    def json_text(n, with_err=False):
+        rows = ["{"]
+        for i in range(n):
+            rows.append('  "key_%04d": %d,' % (i, i * 7 + 1))
+        if with_err:
+            rows.append('  "error": "connect timeout after 30s",')
+        rows.append('  "end": 0')
+        rows.append("}")
+        return "\n".join(rows)
+    json_short = json_text(700)
+    json_long = json_text(900, with_err=True)
     for label, resp, tin, env, want in (
         ("数据类 .log", log_text, {"file_path": "C:/tmp/a.log"}, {}, True),
         ("数据类短文件", "\n".join(log_lines[:80]), {"file_path": "C:/tmp/a.log"}, {}, False),
+        ("结构类 .json 700 行", json_short, {"file_path": "C:/tmp/lock.json"}, {}, False),
+        ("结构类 .json 900 行", json_long, {"file_path": "C:/tmp/lock.json"}, {}, True),
         ("源码 .py 默认", src_text, {"file_path": "C:/tmp/a.py"}, {}, False),
         ("源码 .py 开闸", src_text, {"file_path": "C:/tmp/a.py"}, {"WB_OPS_READ_TRIM": "1"}, True),
     ):
@@ -232,7 +248,7 @@ def main():
             print("[1c] Read %-12s FAIL  输出无法解析：%r" % (label, out[:80]))
             ok = False
             continue
-        keep = ("connect timeout" in body) if label.startswith("数据类") else ("def f_0" in body)
+        keep = ("connect timeout" in body) if label.startswith(("数据类", "结构类")) else ("def f_0" in body)
         mark = "wb-ops" in body
         ratio = 1 - len(body) / max(len(resp), 1)
         status = "PASS" if (keep and mark and ratio > 0.5) else "FAIL  关键字/标记/压缩率不符"
@@ -640,6 +656,7 @@ def main():
             print("[5m] v2 env 覆盖+状态格式 %s" % status)
 
             # 5o（v0.6.2）: 越过实测压缩点仍未触发 → band 3 强提醒（点明"自动压缩没触发"机理）
+            #     v1.3：措辞改为「先答后劝」——先回答当前问题、只暂缓新方向不拒答
             sd = os.path.join(tmp, "v2o"); os.makedirs(sd)
             tp = wl(os.path.join(tmp, "v2o.jsonl"), [
                 ul(152800, "r1", "deepseek-v4.1-flash"), cl(1, "pre-message-auto", "auto", "o1"),
@@ -649,7 +666,8 @@ def main():
             try:
                 ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
                 good = (code == 0 and "已越过" in ctx and "160K" in ctx
-                        and "/compact" in ctx and "发送消息" in ctx)
+                        and "/compact" in ctx and "发送消息" in ctx
+                        and "先照常回答" in ctx and "不要拒绝" in ctx)
             except Exception:
                 good = False
             status = "PASS" if good else "FAIL"

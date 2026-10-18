@@ -125,14 +125,23 @@ static const size_t TRIM_TOOL_COUNT = sizeof(TRIM_TOOLS) / sizeof(TRIM_TOOLS[0])
 //   源码类 —— 仍然只有显式 WB_OPS_READ_TRIM=1 且文件足够长时才走「头 + 尾 + 符号行」。
 static const int READ_MIN_LINES = 1500;   // 源码类 Read 小于这么多行一律不裁
 static const int READ_DATA_MIN_LINES = 200;  // 数据类 Read 门槛（>200 行或超预算就裁）
+// v1.2.2：结构类（.json）单独一档，门槛 800 行——读 json 多半是为了接着 Edit，
+// 中段裁掉后剩下的片段虽仍合法、嵌套结构却断了，补读成本高于省下的 token。
+static const int READ_STRUCT_MIN_LINES = 800;
+// 硬阀：行数不多但体量巨大的（压缩成几行的 dump），不管门槛直接裁
+static const size_t READ_STRUCT_HARD_BYTES = 40000;
 static const int READ_HEAD_LINES = 200;   // Read 头段行数
 static const int READ_TAIL_LINES = 120;   // Read 尾段行数
 
 // v1.2：数据类扩展名（与 hooks/trim.py 的 DATA_EXTS、hooks.json 的 if 规则同一份清单）
 static const char *DATA_EXTS[] = {
-    ".log", ".jsonl", ".ndjson", ".csv", ".tsv", ".out", ".err", ".txt",
+    ".log", ".jsonl", ".ndjson", ".csv", ".tsv", ".out", ".err", ".txt", ".json",
 };
 static const size_t DATA_EXT_COUNT = sizeof(DATA_EXTS) / sizeof(DATA_EXTS[0]);
+
+// v1.2.2：结构类（DATA_EXTS 的子集，走更高门槛）
+static const char *STRUCT_EXTS[] = {".json"};
+static const size_t STRUCT_EXT_COUNT = sizeof(STRUCT_EXTS) / sizeof(STRUCT_EXTS[0]);
 
 // 判定只看扩展名（大小写不敏感），反斜杠先归一化
 static bool is_data_file(const std::string &path) {
@@ -151,6 +160,27 @@ static bool is_data_file(const std::string &path) {
     for (size_t i = 0; i < DATA_EXT_COUNT; i++) {
         const size_t n = strlen(DATA_EXTS[i]);
         if (p.size() >= n && p.compare(p.size() - n, n, DATA_EXTS[i]) == 0) return true;
+    }
+    return false;
+}
+
+// v1.2.2：结构类（.json）—— 属于数据类，但门槛更高
+static bool is_struct_file(const std::string &path) {
+    std::string p = path;
+    for (size_t i = 0; i < p.size(); i++) {
+        if (p[i] == '\\') p[i] = '/';
+    }
+    const std::string trim_ws = " \t\r\n\v\f";
+    size_t a = 0, b = p.size();
+    while (a < b && trim_ws.find(p[a]) != std::string::npos) a++;
+    while (b > a && trim_ws.find(p[b - 1]) != std::string::npos) b--;
+    p = p.substr(a, b - a);
+    for (size_t i = 0; i < p.size(); i++) {
+        if (p[i] >= 'A' && p[i] <= 'Z') p[i] = (char)(p[i] - 'A' + 'a');
+    }
+    for (size_t i = 0; i < STRUCT_EXT_COUNT; i++) {
+        const size_t n = strlen(STRUCT_EXTS[i]);
+        if (p.size() >= n && p.compare(p.size() - n, n, STRUCT_EXTS[i]) == 0) return true;
     }
     return false;
 }
@@ -819,7 +849,7 @@ static FillPass fill_pass(const std::vector<std::string> &lines, size_t total,
 }
 
 static bool trim_text(const std::string &text, bool read_mode, int min_lines,
-                      std::string &out) {
+                      bool strict_gate, size_t hard_bytes, std::string &out) {
     std::vector<std::string> lines;
     {
         size_t st = 0;
@@ -844,9 +874,15 @@ static bool trim_text(const std::string &text, bool read_mode, int min_lines,
         return false;
     }
 
-    // 触发条件：普通工具「行数 > min_lines 且字节不超预算」直接放过；
-    // Read 模式只要「行数 <= min_lines」或「字节不超预算」就放过（长文件才裁）
-    if (!read_mode) {
+    // 触发条件：普通工具「行数 <= min_lines 且字节不超预算」直接放过；
+    // 源码 Read 只要「行数 <= min_lines」或「字节不超预算」就放过（两项都过才裁）；
+    // v1.2.2 结构类 Read 同源码档，但另有体量硬阀
+    if (strict_gate) {
+        // 行数与字节「两项都过线」才裁；但体量超硬阀时行数不再是门槛
+        // （否则 30 行的 60KB dump 会因行数不达标而整段透传，硬阀形同虚设）
+        if (tbytes < hard_bytes &&
+            ((int)total <= min_lines || tbytes <= budget_bytes)) return false;
+    } else if (!read_mode) {
         if ((int)total <= min_lines && tbytes <= budget_bytes) return false;  // 不长，不动
     } else {
         if (total <= (size_t)min_lines || tbytes <= budget_bytes) return false;
@@ -1175,10 +1211,12 @@ int main(int argc, char **argv) {
 
     std::string trimmed;
     // v1.2：Read 按文件类型分档（与 hooks/trim.py 的 main() 同构）
-    //   数据类（日志/表格/清单）—— 普通关键字模式，200 行门槛；
+    //   数据类（日志/表格/清单）—— 普通关键字模式，200 行门槛（.json 结构类 800 行）；
     //   源码类 —— 符号行模式，1500 行门槛，需 WB_OPS_READ_TRIM=1（由 --with-read 写入命令）；
     //   其余 —— 直接透传。
     bool read_mode = false;
+    bool strict_gate = false;   // v1.2.2：结构类用「两项都过线」的严格门槛
+    size_t hard_bytes = 0;      // v1.2.2：结构类体量硬阀
     int min_lines = MAX_LINES;
     if (tool == "Read") {
         std::string path;
@@ -1191,7 +1229,14 @@ int main(int argc, char **argv) {
             }
         }
         if (is_data_file(path)) {
-            min_lines = READ_DATA_MIN_LINES;
+            // 结构类 .json 门槛更高（读它多半是为了接着改），且要两项都过线才裁
+            if (is_struct_file(path)) {
+                min_lines = READ_STRUCT_MIN_LINES;
+                strict_gate = true;
+                hard_bytes = READ_STRUCT_HARD_BYTES;
+            } else {
+                min_lines = READ_DATA_MIN_LINES;
+            }
         } else if (env_flag("WB_OPS_READ_TRIM")) {
             read_mode = true;
             min_lines = READ_MIN_LINES;
@@ -1204,7 +1249,7 @@ int main(int argc, char **argv) {
         trace(std::string("工具 ") + tool + " 失败（结构化或文本信号），保留完整输出，透传");
         return 0;
     }
-    if (!trim_text(text, read_mode, min_lines, trimmed)) {
+    if (!trim_text(text, read_mode, min_lines, strict_gate, hard_bytes, trimmed)) {
         trace(std::string("\xe5\xb7\xa5\xe5\x85\xb7 ") + tool +
               " \xe8\xbe\x93\xe5\x87\xba\xe4\xb8\x8d\xe9\x95\xbf\xef\xbc\x8c\xe4\xb8\x8d\xe8\xa3\x81");
         return 0;

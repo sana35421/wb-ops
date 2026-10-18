@@ -63,7 +63,7 @@ PLUGINS = os.path.join(WB, "plugins")
 MARKETPLACE = "local"   # 市场名；可用 --marketplace NAME 覆盖
 PLUGIN = "wb-ops"
 PLUGIN_ID = "%s@%s" % (PLUGIN, MARKETPLACE)
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 BACKUP_SUFFIX = ".bak-2026-10-15-wbops"
 
 # PostToolUse 两组（v1.2 起）：普通工具一组，Read 数据类文件一组（带 if 条件）
@@ -73,7 +73,7 @@ READ_MATCHER = "Read"
 # 以及 bin/wb-ops-trim.exe --dump-exts 自报的清单必须保持同一份
 # （test_hook.py 用例 1d 会硬校验四处一致）：宿主在 spawn 前用这条 glob 判定，
 # 命中不了的 Read 零开销；生产实际跑的是 exe，只比源码等于没比。
-READ_IF_DEFAULT = "Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt})"
+READ_IF_DEFAULT = "Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt,json})"
 READ_ENV_EXPORT = "export WB_OPS_READ_TRIM=1; "
 
 MARKET_DIR = os.path.join(PLUGINS, "marketplaces", MARKETPLACE)
@@ -232,7 +232,7 @@ def apply_read_matcher(*roots):
     """v1.2：`--with-read` = Read 从「只裁数据类文件」扩到「所有文件」。
 
     默认（不加 --with-read）就已经会裁数据类文件：hooks.json 的 PostToolUse 第二组是
-        {"matcher": "Read", "if": "Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt})"}
+        {"matcher": "Read", "if": "Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt,json})"}
     宿主在 spawn 之前就按 tool_input.file_path 做了 glob 判定，源码文件命不中 →
     hook 根本不启动，所以「数据类默认开」不产生任何空跑开销。
 
