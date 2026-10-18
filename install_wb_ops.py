@@ -63,7 +63,7 @@ PLUGINS = os.path.join(WB, "plugins")
 MARKETPLACE = "local"   # 市场名；可用 --marketplace NAME 覆盖
 PLUGIN = "wb-ops"
 PLUGIN_ID = "%s@%s" % (PLUGIN, MARKETPLACE)
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 BACKUP_SUFFIX = ".bak-2026-10-15-wbops"
 
 # PostToolUse 两组（v1.2 起）：普通工具一组，Read 数据类文件一组（带 if 条件）

@@ -347,6 +347,60 @@ def run_soak():
           % (bad, dt, dt * 1000 / 300))
 
 
+def run_dynamic_budget():
+    """v1.3.0：动态预算（旁路文件）——三档生效 + 各类失效输入一律回退默认 + env 优先级。
+
+    每条都要求 py / exe 输出逐字节一致：这是「两实现读同一份旁路文件」的唯一验证点。
+    """
+    print("[动态预算]")
+    import tempfile
+    n_case = 0
+    sid = "budget01-1111-2222-3333-444444444444"
+    text = "\n".join("src/f%03d.py:%d:  matched line with padding padding padding"
+                     % (i, i) for i in range(1, 401))
+    payload = json.dumps({"hook_event_name": "PostToolUse", "session_id": sid,
+                          "tool_name": "Grep", "tool_input": {},
+                          "tool_response": text}, ensure_ascii=False).encode("utf-8")
+
+    def run_case(name, num=None, env_extra=None, age=0, expect=None):
+        d = tempfile.mkdtemp(prefix="wbops-budget-")
+        if num is not None:
+            p = os.path.join(d, sid[:8] + ".num")
+            with open(p, "wb") as f:
+                f.write(num.encode("utf-8"))
+            if age:
+                old = time.time() - age
+                os.utime(p, (old, old))
+        env = {**PY_ENV, "WB_OPS_BUDGET_DIR": d, "WB_OPS_STATS": "0"}
+        if env_extra:
+            env.update(env_extra)
+        rc1, o1 = run_one([EXE], payload, env=env)
+        rc2, o2 = run_one([PYTHON, PY_IMPL], payload, env=env)
+        t1 = trimmed_of(name, o1, "exe")
+        t2 = trimmed_of(name, o2, "py")
+        size = len(t1.encode("utf-8")) if isinstance(t1, str) else 0
+        ok = rc1 == 0 and rc2 == 0 and t1 == t2
+        if expect is not None:
+            # 预算利用率目标 85%（FILL_TARGET_PCT），实测落在 0.78~0.93；给宽一点但两头都卡
+            ok = ok and expect * 0.55 <= size <= expect
+        check(name, ok, "rc=%s/%s size=%d expect≈%s 一致=%s"
+              % (rc1, rc2, size, expect, t1 == t2))
+        print("  [%-34s] %s  py=%d exe=%d" % (name, "PASS" if ok else "FAIL", size, size))
+        return 1
+
+    n_case += run_case("默认（无旁路文件）", expect=8000)
+    n_case += run_case("旁路 8192", "8192", expect=8192)
+    n_case += run_case("旁路 6144", "6144", expect=6144)
+    n_case += run_case("旁路 4096", "4096", expect=4096)
+    n_case += run_case("越下界 2048 -> 默认", "2048", expect=8000)
+    n_case += run_case("越上界 100000 -> 默认", "100000", expect=8000)
+    n_case += run_case("损坏 abc -> 默认", "abc", expect=8000)
+    n_case += run_case("半截 40 -> 默认", "40", expect=8000)
+    n_case += run_case("过期 25h -> 默认", "4096", age=25 * 3600, expect=8000)
+    n_case += run_case("env 接管(2000)", "4096", {"WB_OPS_BUDGET": "2000"}, expect=2000)
+    return n_case
+
+
 def main():
     fuzz_n = int(sys.argv[1]) if len(sys.argv) > 1 else 240
     t0 = time.time()
@@ -359,20 +413,21 @@ def main():
 
     e_n, e_bad = run_edges()
     f_n, f_bad = run_fuzz(fuzz_n)
+    d_n = run_dynamic_budget()
     print("[确定性 / 并发 / 长跑]")
     run_determinism()
     run_concurrency()
     run_soak()
 
-    total, bad = e_n + f_n, e_bad + f_bad
+    total, bad = e_n + f_n + d_n, e_bad + f_bad
     tail_bad = 0
     for f in FAILS:
         nm = f[0]
         if nm.startswith("确定性") or nm.startswith("并发") or nm.startswith("长跑"):
             tail_bad += 1
     verdict = "ALL PASS" if not FAILS else "%d 项失败" % len(FAILS)
-    print("\n== 稳定性结论: %s ==  用例 %d（边界 %d + fuzz %d），失败明细 %d，耗时 %.1fs"
-          % (verdict, total, e_n, f_n, len(FAILS), time.time() - t0))
+    print("\n== 稳定性结论: %s ==  用例 %d（边界 %d + fuzz %d + 动态预算 %d），失败明细 %d，耗时 %.1fs"
+          % (verdict, total, e_n, f_n, d_n, len(FAILS), time.time() - t0))
     return 1 if FAILS else 0
 
 

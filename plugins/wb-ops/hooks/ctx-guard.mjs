@@ -87,6 +87,15 @@ const HOST_HOME = (() => {
 const STATE_DIR = process.env.WB_OPS_CTX_GUARD_DIR ||
     path.join(os.homedir(), '.workbuddy', 'wb-ops-data');
 const STATE_FILE = path.join(STATE_DIR, 'ctx-guard.json');
+// v1.3.0：动态预算旁路目录。默认按 USERPROFILE 落（trim 侧就是这么找的）；
+// 测试用 WB_OPS_CTX_GUARD_DIR / WB_OPS_BUDGET_DIR 覆盖时跟着走，别污染真实数据目录。
+const BUDGET_DIR = (process.env.WB_OPS_BUDGET_DIR || '').trim() ||
+    (process.env.WB_OPS_CTX_GUARD_DIR
+        ? path.join(STATE_DIR, 'budget')
+        : path.join(os.homedir(), '.workbuddy', 'wb-ops-data', 'budget'));
+const BUDGET_LEVELS = [8192, 6144, 4096];   // 低 / 中 / 高三档（字节）
+const BUDGET_BAND = [0.75, 0.90];           // 越 75%T 收紧一档，越 90%T 收到最紧
+const BUDGET_TTL_MS = 7 * 24 * 3600 * 1000; // 旁路文件保留 7 天（trim 侧 24h 后即不认）
 const SETTINGS_FILE = path.join(HOST_HOME, 'settings.json');
 const PRODUCT_CFG_FILE = path.join(HOST_HOME, 'cache', 'acc-product-config-v3.json');
 
@@ -186,7 +195,11 @@ function saveState(st) {
             }
         }
         fs.mkdirSync(STATE_DIR, { recursive: true });
-        fs.writeFileSync(STATE_FILE, JSON.stringify(st));
+        // v1.3.0：临时文件 + rename 原子替换。原先直写会在多会话并发时互相截断，
+        // 那一刻读到的半截 JSON 会让 loadState() 退回空状态（档位重复提醒 / 学习样本丢失）。
+        const tmp = STATE_FILE + '.' + process.pid + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(st));
+        fs.renameSync(tmp, STATE_FILE);
     } catch { /* ignore */ }
 }
 
@@ -300,6 +313,54 @@ function postText(seq, post) {
         '请在本次回复末尾明确建议用户：尽快收尾当前任务并新建会话继续（先写入记忆衔接）。不要中断正在进行的任务。';
 }
 
+/**
+ * v1.3.0：按水位算裁剪预算（字节）。
+ * T 未知时用 FALLBACK_STRONG 当 T——与提醒档位复用同一个兜底，不另拍一个数。
+ * 刚压缩过（水位已回落）时按最松一档，等下一轮重新评估。
+ */
+function budgetFor(level, T, afterCompaction) {
+    if (afterCompaction) return BUDGET_LEVELS[0];
+    const ref = T > 0 ? T : FALLBACK_STRONG;
+    if (level >= ref * BUDGET_BAND[1]) return BUDGET_LEVELS[2];
+    if (level >= ref * BUDGET_BAND[0]) return BUDGET_LEVELS[1];
+    return BUDGET_LEVELS[0];
+}
+
+/**
+ * 落纯整数旁路文件 <sid8>.num：trim 侧（py 与 exe）只做「读一行 → atoi → 范围校验」。
+ * 写临时文件再 rename：多会话并发时不会互相截断（原 ctx-guard.json 的 writeFileSync 会）。
+ */
+function writeBudget(sid, bytes) {
+    try {
+        fs.mkdirSync(BUDGET_DIR, { recursive: true });
+        const fp = path.join(BUDGET_DIR, sid + '.num');
+        const tmp = fp + '.' + process.pid + '.tmp';
+        fs.writeFileSync(tmp, String(bytes));
+        fs.renameSync(tmp, fp);
+        pruneBudget();
+    } catch { /* ignore */ }
+}
+
+/** 清理 7 天前的旁路文件（目录大小有界；单次最多删 20 个，别让钩子变慢） */
+function pruneBudget() {
+    try {
+        const now = Date.now();
+        const names = fs.readdirSync(BUDGET_DIR);
+        let n = 0;
+        for (const name of names) {
+            if (n >= 20) break;
+            if (!name.endsWith('.num') && !name.endsWith('.tmp')) continue;
+            const fp = path.join(BUDGET_DIR, name);
+            try {
+                if (now - fs.statSync(fp).mtimeMs > BUDGET_TTL_MS) {
+                    fs.unlinkSync(fp);
+                    n++;
+                }
+            } catch { /* ignore */ }
+        }
+    } catch { /* ignore */ }
+}
+
 function main() {
     if (OFF) return;
     const raw = readStdin();
@@ -370,9 +431,11 @@ function main() {
 
     if (warn) msgs.push(postText(warn.seq, warn.post));
 
+    let linesT = 0;
     if (!pendingSeq) {
         // 存在未决压缩时跳过档位判断（此时尾部的“最近水位”可能还是压缩前的旧值）
         const lines = resolveLines(st, modelKey);
+        linesT = lines.T;
         let band = 0;
         if (lines.T > 0 && L >= lines.T) {
             // v0.6.2：越过实测自动压缩点却仍未压缩——宿主只会在发送消息时检查，
@@ -389,6 +452,9 @@ function main() {
             if (!warn) msgs.push(bandText(band, L, lines.T)); // 压缩后已有强提醒则不重复
         }
     }
+
+    // v1.3.0：按水位决定下一轮工具输出的裁剪预算（低/中/高三档），落纯整数旁路文件
+    writeBudget(sid, budgetFor(L, linesT, !!pendingSeq));
 
     s.u = Date.now();
     st.sessions[sid] = s;

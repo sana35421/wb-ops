@@ -271,6 +271,41 @@ def build_cases():
     cases.append(("Read .json 30 行超大（硬阀裁剪）", "Read", "\n".join(big_rows),
                   {}, {"file_path": "D:/tmp/dump.json"}))
 
+    # ---- v1.3.0 新增：文档档 .md ----
+    # 门槛同结构档（800 行且超预算），但中段捞回特征换成 Markdown 标题行：
+    # md 里没有 error 关键字可言，按关键字捞只会捞出一堆噪声。
+    def md_doc(n, headings=True, tail_tag=False):
+        """造 n 行 md：每 100 行一个二级标题，其余是短正文行。
+
+        刻意把每行压到 20 字节以内：700 行≈13KB，能超 8KB 预算但够不到 40KB 硬阀，
+        这样「700 行透传」才真的在验证 800 行门槛，而不是被体量硬阀顺手裁掉。
+        """
+        rows = []
+        for i in range(n):
+            if headings and i % 100 == 0:
+                rows.append("## section %d" % (i // 100))
+            elif tail_tag and i == n - 1:
+                rows.append("#hashtag 不是标题")   # '#' 后无空白 → 不算标题
+            else:
+                rows.append("body line %d text" % i)
+        return "\n".join(rows)
+
+    # 45. .md 700 行：行数未过 800 → 透传（与结构档同一道门槛）
+    cases.append(("Read .md 700 行（透传）", "Read", md_doc(700),
+                  {}, {"file_path": "D:/tmp/guide.md"}))
+
+    # 46. .md 1200 行带标题：两项都过线 → 裁剪，且捞回的是标题行
+    cases.append(("Read .md 1200 行（标题行捞回）", "Read", md_doc(1200),
+                  {}, {"file_path": "D:/tmp/guide.md"}))
+
+    # 47. .md 无标题：标记应说「未发现 Markdown 标题」，不能套用 error 关键字文案
+    cases.append(("Read .md 无标题（文案）", "Read", md_doc(1200, headings=False),
+                  {}, {"file_path": "D:/tmp/plain.md"}))
+
+    # 48. 大写 .MD + 反斜杠路径 + 行尾 `#hashtag`（不算标题）→ 仍走文档档
+    cases.append(("Read .MD 大写（文档档）", "Read", md_doc(1200, tail_tag=True),
+                  {}, {"file_path": "D:\\tmp\\README.MD"}))
+
     return cases
 
 
@@ -611,6 +646,14 @@ def main():
             assert_fail += 1
             print("        !! 超大 dump 未裁剪：40KB 硬阀失效")
 
+        # ---- v1.3.0：文档档 .md（同样要放在 isinstance 之外）----
+        if name == "Read .md 700 行（透传）" and n_ex is not None:
+            assert_fail += 1
+            print("        !! .md 700 行被裁了：文档档应与结构档同门槛（800 行且超预算）")
+        if name == "Read .md 1200 行（标题行捞回）" and n_ex is None:
+            assert_fail += 1
+            print("        !! .md 1200 行未裁剪：文档档门槛失效")
+
         # ---- 专项断言：字节上界 / 整行保真 / 关键行捞回 / 抽样覆盖 ----
         if isinstance(n_ex, str):
             blen_ex = len(n_ex.encode("utf-8"))
@@ -633,6 +676,26 @@ def main():
             if name == "关键字超 40 均匀抽样" and not ("err-0050" in n_ex and "err-2950" in n_ex):
                 assert_fail += 1
                 print("        !! 关键字超限抽样未覆盖全局")
+            # ---- v1.3.0：文档档捞回特征 ----
+            if name == "Read .md 1200 行（标题行捞回）" and not (
+                    "以下为捞回的" in n_ex and "条标题行" in n_ex and "## section" in n_ex):
+                assert_fail += 1
+                print("        !! .md 未按标题行捞回（应出现「条标题行」与 ## section）")
+            if name == "Read .md 无标题（文案）" and "未发现 Markdown 标题" not in n_ex:
+                assert_fail += 1
+                print("        !! .md 无标题时文案不对：应写明未发现 Markdown 标题")
+            if name == "Read .MD 大写（文档档）" and "未发现 Markdown 标题" in n_ex:
+                assert_fail += 1
+                print("        !! `#hashtag` 被误判成标题（'#' 后无空白不算标题）")
+            # 行号可用性只跟「工具是不是 Read」有关，与裁剪档位无关：
+            # 数据类 Read 走关键字模式（read_mode 为假），但它照样能用 offset 回查。
+            if name == "Read .log 数据类（裁剪）" and "可 Read offset=" not in n_ex:
+                assert_fail += 1
+                print("        !! 数据类 Read 没给 offset 回查指路（line_mode 判定错了）")
+            if name == "关键字超 40 均匀抽样" and "可 Read offset=" in n_ex:
+                assert_fail += 1
+                print("        !! Grep 结果不该给 offset 指路：它没有文件行号")
+
             # ---- v0.6.1 新增断言 ----
             if name == "头段关键字被挤出后捞回" and not (
                     "database connection failed" in n_ex and "未发现" not in n_ex):
@@ -719,7 +782,14 @@ def main():
     print("  提速                        : %7.1f 倍" % (t_py / t_ex if t_ex else 0))
 
     # 模拟 hook 真实调用（经 bash 包装）
-    bash = r"C:\Users\Administrator\.workbuddy\binaries\PortableGit\versions\1.3.0\bin\bash.exe"
+    bash = os.environ.get("WB_OPS_TEST_BASH") or shutil.which("bash") or ""
+    if not bash:
+        for cand in ("C:/Program Files/Git/bin/bash.exe",
+                     "C:/Program Files/Git/usr/bin/bash.exe",
+                     "C:/Program Files (x86)/Git/bin/bash.exe"):
+            if os.path.exists(cand):
+                bash = cand
+                break
     if os.path.exists(bash):
         root_msys = to_msys(PLUGIN)  # 永远指向当前所在的这份代码，不再硬编码旧路径
         cmd_new = '"%s/bin/wb-ops-trim.exe" 2>/dev/null || exit 0' % root_msys
@@ -734,7 +804,7 @@ def main():
 
         cmd_old = ('for PY in "$(command -v python)" "%s"; do [ -n "$PY" ] && [ -x "$PY" ] '
                    '&& "$PY" "%s/hooks/trim.py" && break; done; exit 0'
-                   % ("/c/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.exe", root_msys))
+                   % (to_msys(sys.executable), root_msys))
         subprocess.run([bash, "-c", cmd_old], input=payload, capture_output=True, env=env)
         t0 = time.perf_counter()
         for _ in range(N):

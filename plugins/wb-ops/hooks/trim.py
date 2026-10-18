@@ -35,7 +35,7 @@ MAX_BYTES = 8000        # 默认预算：字节数超过这个才裁（触发条
 MAX_KEY_LINES = 40      # 中间区域最多捞回多少条关键行（超出则均匀抽样）
 MIN_LINE_BYTES = 60     # 截断展示时单行至少保留的字节数，低于此值整行丢弃
 MAX_LINE_BYTES = 1000   # 单行最多展示的字节数（防 minified 超长行吃掉预算）
-MARKER_RESERVE = 300    # 给省略标记预留的字节数
+MARKER_RESERVE = 420    # 给省略标记预留的字节数（v1.3.0：标记里多了「最长连续段 offset/limit」提示）
 
 # ---- v0.3.5：预算可配置（WB_OPS_BUDGET，单位字节）----
 BUDGET_MIN = 2000       # 允许的最小预算（再窄内容只剩骨架）
@@ -61,6 +61,10 @@ FILL_TARGET_PCT = 85    # 预算利用率目标：低于这个就放大头尾，
 MARK_OMIT = "[wb-ops 省略"
 MARK_TAIL = "[wb-ops 以下为原文末尾"
 
+# v1.3.0：省略标记里的「回查指路」——只给最长连续空洞，且要够长才值得给
+GAP_HINT_MIN_LINES = 20    # 最长空洞不足这么多行就不指路（读一次也不贵）
+GAP_HINT_MAX_LINES = 180   # 提示的 limit 上限：太大又会被同一道门槛裁一次
+
 # ---- v0.6.9：Read 按需裁剪（v1.2 起按文件类型分档）----
 READ_MIN_LINES = 1500   # 源码类 Read 小于这么多行一律不裁（源码要完整读）
 # v1.2：数据类文件（日志/表格/清单）走「低门槛 + 关键字行」，不需要 WB_OPS_READ_TRIM。
@@ -74,8 +78,17 @@ READ_DATA_MIN_LINES = 200   # 数据类 Read 的门槛（>200 行且超预算就
 READ_STRUCT_MIN_LINES = 800
 # 硬阀：行数不多但体量巨大的（压缩成几行的 dump），不管门槛直接裁
 READ_STRUCT_HARD_BYTES = 40000
-DATA_EXTS = (".log", ".jsonl", ".ndjson", ".csv", ".tsv", ".out", ".err", ".txt", ".json")
+# v1.3.0：文档档（.md）门槛与结构档同源——理由也一样：读完多半要接着改。
+# 中段捞回特征不同（标题行），门槛数值没必要另立一套，直接复用常量保持单一真源。
+READ_DOC_MIN_LINES = READ_STRUCT_MIN_LINES
+READ_DOC_HARD_BYTES = READ_STRUCT_HARD_BYTES
+DATA_EXTS = (".log", ".jsonl", ".ndjson", ".csv", ".tsv", ".out", ".err", ".txt", ".json", ".md")
 STRUCT_EXTS = (".json",)   # 结构类（DATA_EXTS 的子集，走更高门槛）
+# v1.3.0：文档档（.md）—— 门槛同结构档（读完多半要接着改，中段不能随便丢），
+# 但中段捞回特征换成标题行：md 里没有 error 关键字可言，按关键字捞只会捞出一堆噪声，
+# 而标题行本身就是目录骨架，模型据此判断「要不要回查那一段」。
+DOC_EXTS = (".md",)
+DOC_HEAD_PATTERN = re.compile(r"^#{1,6}[ \t]")   # ASCII 空白，与 C++ 侧逐字节一致（\s 在 py 是 Unicode 语义）
 # v1.1：Read 的头尾行数也走自适应（见 READ_HEAD_MIN/READ_HEAD_MAX 等）
 
 # Read 模式下的「符号行」：函数 / 类 / 结构 / 导入等骨架行
@@ -103,6 +116,12 @@ def is_struct_file(path):
     """v1.2.2：结构类（.json）—— 属于数据类，但门槛更高（见 READ_STRUCT_MIN_LINES）。"""
     p = (path or "").strip().lower().replace("\\", "/")
     return p.endswith(STRUCT_EXTS)
+
+
+def is_doc_file(path):
+    """v1.3.0：文档档（.md）—— 门槛同结构档，中段改捞标题行。"""
+    p = (path or "").strip().lower().replace("\\", "/")
+    return p.endswith(DOC_EXTS)
 
 
 def env_flag(name):
@@ -170,18 +189,77 @@ def looks_json(text):
     return True
 
 
-def resolve_budget():
-    """解析 WB_OPS_BUDGET 环境变量，得到本次裁剪的字节预算；默认 MAX_BYTES。
+# ---- v1.3.0：按上下文水位动态预算（ctx-guard 决策，落纯整数旁路文件）----
+# 为什么不读 ctx-guard.json：C++ 侧对它只有宽松解析，Python 侧是 json.loads 抛异常回退，
+# 并发写到一半时两边必然分叉，而 parity 用例照不到这种时序。纯数字文件只需 atoi + 范围校验。
+BUDGET_DECIDE_MIN = 4096    # 旁路文件允许的最小值（再低正文只剩骨架，模型会重读）
+BUDGET_DECIDE_MAX = 8192    # 旁路文件允许的最大值（即默认预算，再高等于没收紧）
+BUDGET_FILE_TTL = 86400     # 旁路文件超过这个秒数视为过期
+_CUR_SID = ""               # 本次 hook 调用的会话 id（main() 里设置，供 resolve_budget 定位文件）
 
-    纯 ASCII 数字（与 src/trim.cpp 的 resolve_budget 完全一致，parity 有专项用例）：
-    空值/含非数字 -> 回退默认；有效值收敛到 [BUDGET_MIN, BUDGET_CAP]。
+
+def budget_dir():
+    """旁路预算文件目录：WB_OPS_BUDGET_DIR 覆盖，默认 <数据目录>/budget。
+
+    数据目录与记账共用一套约定（WB_OPS_STATS_DIR → %USERPROFILE%/.workbuddy/wb-ops-data）。
+    """
+    d = (os.environ.get("WB_OPS_BUDGET_DIR") or "").strip(" \t\r\n")
+    if d:
+        return d
+    base = os.environ.get("WB_OPS_STATS_DIR")
+    if not base:
+        home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        if not home:
+            return ""
+        base = os.path.join(home, ".workbuddy", "wb-ops-data")
+    return os.path.join(base, "budget")
+
+
+def read_budget_hint():
+    """读当前会话的预算旁路文件；任何异常/越界/过期都返回 0（= 用默认预算）。
+
+    只认 1~6 位纯 ASCII 数字，且落在 [BUDGET_DECIDE_MIN, BUDGET_DECIDE_MAX]。
+    """
+    if not _CUR_SID:
+        return 0
+    try:
+        d = budget_dir()
+        if not d:
+            return 0
+        p = os.path.join(d, _CUR_SID + ".num")
+        if time.time() - os.stat(p).st_mtime > BUDGET_FILE_TTL:
+            return 0
+        with open(p, "rb") as f:
+            raw = f.read(16)
+        s = raw.decode("ascii", "ignore").strip(" \t\r\n")
+        if not re.fullmatch(r"[0-9]{1,6}", s):
+            return 0
+        v = int(s)
+        if v < BUDGET_DECIDE_MIN or v > BUDGET_DECIDE_MAX:
+            return 0
+        return v
+    except Exception:
+        return 0
+
+
+def resolve_budget():
+    """得到本次裁剪的字节预算；默认 MAX_BYTES。
+
+    优先级（v1.3.0）：
+      1. `WB_OPS_BUDGET` 设了非空值 → 完全接管（合法数字收敛到 [BUDGET_MIN, BUDGET_CAP]，
+         非法值回退 MAX_BYTES，保持 1.2.x 的行为）；
+      2. 旁路文件 `wb-ops-data/budget/<sid8>.num`（由 ctx-guard 按水位写入的纯整数）；
+      3. 默认 MAX_BYTES。
     """
     s = (os.environ.get("WB_OPS_BUDGET") or "").strip(" \t\r\n\v\f")
-    if not s or not re.fullmatch(r"[0-9]+", s):
-        return MAX_BYTES
-    if len(s) > 9:
-        return BUDGET_CAP  # 位数过多，必然越上界
-    return min(max(int(s), BUDGET_MIN), BUDGET_CAP)
+    if s:
+        if not re.fullmatch(r"[0-9]+", s):
+            return MAX_BYTES
+        if len(s) > 9:
+            return BUDGET_CAP  # 位数过多，必然越上界
+        return min(max(int(s), BUDGET_MIN), BUDGET_CAP)
+    v = read_budget_hint()
+    return v if v else MAX_BYTES
 
 # ---- 只处理这几类高频大输出工具 ----
 TRIM_TOOLS = {"Bash", "Grep", "Glob", "Read", "WebFetch"}
@@ -352,7 +430,47 @@ def fill_lines(cands, cap, used):
     return chosen, used
 
 
-def trim(text, read_mode=False, min_lines=MAX_LINES, strict_gate=False, hard_bytes=0):
+def gap_hint(shown, total, read_mode):
+    """v1.3.0：把未显示区切成连续段，取最长的一段，给出能直接用的 offset/limit。
+
+    为什么不用 rng_lo/rng_hi：那两个数是「所有未显示行的最小/最大值」，不是连续区间。
+    sampled=True 时关键字行撒满全文，rng_lo..rng_hi 几乎覆盖全文，照着读等于把原文
+    重读一遍——比不给提示更糟。只认成段空洞，模型读一次就能补上最大的一块。
+
+    只在 read_mode 下给：Grep/Glob/WebFetch 的结果没有文件行号，offset 无从谈起。
+    """
+    if not read_mode:
+        return ""
+    runs = []
+    i = 0
+    while i < total:
+        if i in shown:
+            i += 1
+            continue
+        j = i
+        while j < total and j not in shown:
+            j += 1
+        runs.append((i, j - i))
+        i = j
+    if not runs:
+        return ""
+    best_i, best_len = runs[0]
+    for st, ln in runs[1:]:
+        if ln > best_len:   # 并列取靠前的一段（C++ 侧同用严格大于）
+            best_i, best_len = st, ln
+    if best_len < GAP_HINT_MIN_LINES:
+        return ""   # 空洞太碎，指路反而误导
+    lim = best_len if best_len < GAP_HINT_MAX_LINES else GAP_HINT_MAX_LINES
+    off = best_i + 1
+    hint = "；最长连续段第 %d–%d 行，可 Read offset=%d limit=%d" % (
+        off, off + lim - 1, off, lim)
+    if len(runs) > 1:
+        hint += "（共 %d 段）" % len(runs)
+    return hint
+
+
+def trim(text, read_mode=False, min_lines=MAX_LINES, strict_gate=False, hard_bytes=0,
+         doc_mode=False, line_ok=False):
     """返回裁剪后的文本；如果不需要裁剪则返回 None。
 
     输出结构：开头行 → [省略标记] → 捞回的关键行 → [末尾标记] → 结尾行
@@ -365,11 +483,16 @@ def trim(text, read_mode=False, min_lines=MAX_LINES, strict_gate=False, hard_byt
     v0.6.9：标记带行号区间（供模型 offset 定向回查）；read_mode 时按「头 + 尾 + 符号行」
     处理源码，并用符号行措辞。
     v1.2：min_lines 参数化行数门槛——普通 120、源码 Read 1500、数据类 Read 200。
+    v1.3.0：doc_mode（.md 文档档）——中段改捞 Markdown 标题行，措辞随之切换。
     """
     lines = text.split("\n")
     total = len(lines)
     tbytes = blen(text)
     budget_bytes = resolve_budget()   # v0.3.5：可用 WB_OPS_BUDGET 覆盖（默认 8000）
+    # 「行号可用」= 结果来自 Read：只有它才有 offset/limit。
+    # 注意不能用 read_mode 代替——read_mode 的语义是「按符号行裁剪」（源码档），
+    # 数据类/结构类 Read 走关键字模式，read_mode 为假，但它们同样是行可寻址的。
+    line_mode = read_mode or doc_mode or line_ok
 
     # v1.1：已带本插件标记的文本不再二次裁剪（幂等，免得越裁越碎）
     if MARK_OMIT in text or MARK_TAIL in text:
@@ -412,14 +535,24 @@ def trim(text, read_mode=False, min_lines=MAX_LINES, strict_gate=False, hard_byt
         lt = budget_bytes * 3 // 10
         head = u8_prefix(text, lh)
         tail = u8_suffix(text, lt)
-        marker = "… [wb-ops 省略 %d 字节] …" % (tbytes - blen(head) - blen(tail))
+        marker = "… [wb-ops 省略 %d 字节" % (tbytes - blen(head) - blen(tail))
+        if line_mode:
+            # v1.3.0：这里没有行号可用，offset/limit 是行导向的，给了反而误导
+            marker += "；行数极少但字节很大，按行跳不过去，建议 Grep -n 检索"
+        marker += "] …"
         if looks_json(text):
             marker += "\n… [wb-ops 注：原文为 JSON 结构，截断后已非合法 JSON] …"
         return "%s\n%s\n%s" % (head, marker, tail)
 
     # 命中统计（全文一次预计算，供候选集与标记文案复用）
-    # 普通模式认 error/warning 等关键字；Read 模式认函数/类/import 等符号行
-    hit = is_symbol_line if read_mode else (lambda ln: bool(KEY_PATTERN.search(ln)))
+    # 普通模式认 error/warning 等关键字；Read 模式认函数/类/import 等符号行；
+    # 文档档认 Markdown 标题行（# ~ ######，且 # 后必须跟空白，`#tag` 不算标题）
+    if read_mode:
+        hit = is_symbol_line
+    elif doc_mode:
+        hit = lambda ln: bool(DOC_HEAD_PATTERN.match(ln))
+    else:
+        hit = lambda ln: bool(KEY_PATTERN.search(ln))
     is_key = [bool(hit(line)) for line in lines]
     hit_total = sum(is_key)   # 全文命中总数 M（标记文案用）
 
@@ -491,31 +624,37 @@ def trim(text, read_mode=False, min_lines=MAX_LINES, strict_gate=False, hard_byt
     silent = total - shown_count
 
     # v0.6.9：未显示区间的首末行号（1 基），写进标记供模型 offset 定向回查
+    # （v1.3.0：这两个数只用来描述「省略发生在哪一段」，不作为回查建议——
+    #   回查建议走 gap_hint() 的最长连续空洞）
     omitted_idx = [i for i in range(total) if i not in shown]
     rng_lo = omitted_idx[0] + 1 if omitted_idx else 0
     rng_hi = omitted_idx[-1] + 1 if omitted_idx else 0
+    hint = gap_hint(shown, total, line_mode)
 
-    key_word = "符号行" if read_mode else "关键字行"
+    if doc_mode:
+        key_word, hit_word, samp_word = "标题行", "Markdown 标题", "命中标题行"
+    elif read_mode:
+        key_word, hit_word, samp_word = "符号行", "函数/类/import 行", "命中符号"
+    else:
+        key_word, hit_word, samp_word = "关键字行", "error/warning 关键字", "命中关键字"
     parts = list(head_shown)
     if key_shown:
         if sampled:
-            parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行），%s的 %d 条中均匀抽取 %d 条如下] …"
+            parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行），%s的 %d 条中均匀抽取 %d 条如下%s] …"
                          % (silent, rng_lo, rng_hi,
-                            "命中符号" if read_mode else "命中关键字",
-                            pool_n, len(key_shown)))
+                            samp_word, pool_n, len(key_shown), hint))
         else:
             marker = ("… [wb-ops 省略 %d 行（第 %d–%d 行），以下为捞回的 %d 条%s"
                       % (silent, rng_lo, rng_hi, len(key_shown), key_word))
             if len(key_shown) < hit_total:
                 marker += "（共命中 %d 条）" % hit_total
-            parts.append(marker + ("，可加 offset 回查] …" if read_mode else "] …"))
+            parts.append(marker + (hint if hint else ("，可用 offset 回查" if line_mode else "")) + "] …")
     elif hit_total:
-        parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行，%s已包含在显示区域）] …"
-                     % (silent, rng_lo, rng_hi, key_word))
+        parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行，%s已包含在显示区域）%s] …"
+                     % (silent, rng_lo, rng_hi, key_word, hint))
     else:
-        parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行，未发现 %s）] …"
-                     % (silent, rng_lo, rng_hi,
-                        "函数/类/import 行" if read_mode else "error/warning 关键字"))
+        parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行，未发现 %s）%s] …"
+                     % (silent, rng_lo, rng_hi, hit_word, hint))
     parts.extend(key_shown)
     if looks_json(text):
         # P1-2：行导向裁剪后必然不是合法 JSON，明说一句，省得模型拿去 json.loads 白跑
@@ -570,6 +709,10 @@ def main():
 
     if not isinstance(data, dict):
         return
+    # v1.3.0：先记下会话 id——resolve_budget() 靠它找 ctx-guard 落的预算旁路文件
+    global _CUR_SID
+    _sid_raw = data.get("session_id")
+    _CUR_SID = _sid_raw[:8] if isinstance(_sid_raw, str) else ""
     if data.get("hook_event_name") != "PostToolUse":
         trace("事件不是 PostToolUse，透传")
         return
@@ -606,6 +749,7 @@ def main():
         #   源码类：仍要 WB_OPS_READ_TRIM=1，门槛 1500 行，按符号行裁剪。
         # hooks.json 的 if 规则已把源码文件挡在 hook 之外，所以这里两条路径互不干扰。
         read_mode = False
+        doc_mode = False        # v1.3.0：文档档（.md），中段捞回标题行
         strict_gate = False     # v1.2.2：结构类用「两项都过线」的严格门槛
         hard_bytes = 0          # v1.2.2：结构类体量硬阀
         min_lines = MAX_LINES
@@ -623,6 +767,12 @@ def main():
                     min_lines = READ_STRUCT_MIN_LINES
                     strict_gate = True
                     hard_bytes = READ_STRUCT_HARD_BYTES
+                elif is_doc_file(path):
+                    # 门槛与结构档一致，只是中段捞回特征不同（文档没有 error 关键字）
+                    min_lines = READ_DOC_MIN_LINES
+                    strict_gate = True
+                    hard_bytes = READ_DOC_HARD_BYTES
+                    doc_mode = True
                 else:
                     min_lines = READ_DATA_MIN_LINES
             elif env_flag("WB_OPS_READ_TRIM"):
@@ -636,7 +786,8 @@ def main():
         if resp_failed(resp) or text_failed(text):
             trace("工具 %s 失败（结构化或文本信号），保留完整输出，透传" % tool)
             return
-        trimmed = trim(text, read_mode, min_lines, strict_gate, hard_bytes)
+        trimmed = trim(text, read_mode, min_lines, strict_gate, hard_bytes, doc_mode,
+                       tool == "Read")
     except Exception as e:   # 兜底：裁剪出任何意外都静默透传，绝不让 hook 挂住会话
         trace("裁剪异常，透传：%r" % (e,))
         return

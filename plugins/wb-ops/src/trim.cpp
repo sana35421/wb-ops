@@ -36,6 +36,7 @@
 #include <direct.h>
 #include <fcntl.h>
 #include <io.h>
+#include <sys/stat.h>
 #include <windows.h>
 
 // ---------------------------------------------------------------------------
@@ -49,7 +50,7 @@ static const int MAX_BYTES = 8000;     // 默认预算：字节数超过这个�
 static const int MAX_KEY_LINES = 40;   // 中间区域最多捞回多少条关键行（超出则均匀抽样）
 static const int MIN_LINE_BYTES = 60;  // 截断展示时单行至少保留的字节数，低于此值整行丢弃
 static const int MAX_LINE_BYTES = 1000;// 单行最多展示的字节数（防 minified 超长行吃掉预算）
-static const int MARKER_RESERVE = 300; // 给省略标记预留的字节数
+static const int MARKER_RESERVE = 420; // 给省略标记预留的字节数（v1.3.0：含最长连续段 offset 提示）
 
 // ---- v0.3.5：预算可配置（WB_OPS_BUDGET，单位字节）----
 static const int BUDGET_MIN = 2000;    // 允许的最小预算（再窄内容只剩骨架）
@@ -71,18 +72,77 @@ static const int FILL_TARGET_PCT = 85; // 预算利用率目标：低于这个�
 static const char *MARK_OMIT = "[wb-ops 省略";
 static const char *MARK_TAIL = "[wb-ops 以下为原文末尾";
 
+// v1.3.0：省略标记里的「回查指路」——只给最长连续空洞，且要够长才值得给
+static const int GAP_HINT_MIN_LINES = 20;   // 最长空洞不足这么多行就不指路
+static const int GAP_HINT_MAX_LINES = 180;  // 提示的 limit 上限（太大会被同一道门槛再裁一次）
+
+// ---- v1.3.0：按上下文水位动态预算（ctx-guard 决策，落纯整数旁路文件）----
+// 为什么不读 ctx-guard.json：本文件的 JVal 对半截 JSON 是宽松解析，Python 的 json.loads
+// 是抛异常回退，并发写时两边必然分叉。纯数字文件只需 atoi + 范围校验。
+static const int BUDGET_DECIDE_MIN = 4096;   // 旁路文件允许的最小值
+static const int BUDGET_DECIDE_MAX = 8192;   // 旁路文件允许的最大值（即默认预算）
+static const long long BUDGET_FILE_TTL = 86400;  // 旁路文件超过这个秒数视为过期
+static std::string g_sid;                    // 本次 hook 调用的会话 id（前 8 字符）
+
+// 旁路预算文件目录：WB_OPS_BUDGET_DIR 覆盖，默认 <数据目录>\budget（与 trim.py 同构）
+static std::string budget_dir() {
+    const char *d = std::getenv("WB_OPS_BUDGET_DIR");
+    if (d && *d) return std::string(d);
+    const char *base = std::getenv("WB_OPS_STATS_DIR");
+    std::string b = (base && *base) ? std::string(base) : std::string();
+    if (b.empty()) {
+        const char *home = std::getenv("USERPROFILE");
+        if (!home || !*home) return "";
+        b = std::string(home) + "\\.workbuddy\\wb-ops-data";
+    }
+    return b + "\\budget";
+}
+
+// 读当前会话的预算旁路文件；任何异常/越界/过期都返回 0（= 用默认预算）。
+// 只认 1~6 位纯 ASCII 数字，且落在 [BUDGET_DECIDE_MIN, BUDGET_DECIDE_MAX]。
+static int read_budget_hint() {
+    if (g_sid.empty()) return 0;
+    std::string dir = budget_dir();
+    if (dir.empty()) return 0;
+    std::string p = dir + "\\" + g_sid + ".num";
+    struct _stati64 st;
+    if (_stati64(p.c_str(), &st) != 0) return 0;
+    long long now = (long long)time(NULL);
+    if (now - (long long)st.st_mtime > BUDGET_FILE_TTL) return 0;
+    FILE *f = fopen(p.c_str(), "rb");
+    if (!f) return 0;
+    char buf[16];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    size_t a = 0, b = n;
+    const std::string ws = " \t\r\n\v\f";
+    while (a < b && ws.find(buf[a]) != std::string::npos) a++;
+    while (b > a && ws.find(buf[b - 1]) != std::string::npos) b--;
+    if (a == b || b - a > 6) return 0;
+    int v = 0;
+    for (size_t k = a; k < b; k++) {
+        if (buf[k] < '0' || buf[k] > '9') return 0;
+        v = v * 10 + (buf[k] - '0');
+    }
+    if (v < BUDGET_DECIDE_MIN || v > BUDGET_DECIDE_MAX) return 0;
+    return v;
+}
+
 // 解析 WB_OPS_BUDGET，得到本次裁剪的字节预算；默认 MAX_BYTES。
-// 纯 ASCII 数字（与 hooks/trim.py 的 resolve_budget 完全一致，parity 有专项用例）：
-// 空值/含非数字 -> 回退默认；有效值收敛到 [BUDGET_MIN, BUDGET_CAP]。
+// 优先级（与 hooks/trim.py 的 resolve_budget 一致）：
+//   1. WB_OPS_BUDGET 非空 -> 完全接管（合法数字收敛到 [BUDGET_MIN, BUDGET_CAP]，非法回退默认）
+//   2. 旁路文件 -> 3. 默认 MAX_BYTES
 static int resolve_budget() {
     const char *env = std::getenv("WB_OPS_BUDGET");
-    if (!env) return MAX_BYTES;
-    std::string s(env);
+    std::string s = env ? env : "";
     const std::string ws = " \t\r\n\v\f";
     size_t a = 0, b = s.size();
     while (a < b && ws.find(s[a]) != std::string::npos) a++;
     while (b > a && ws.find(s[b - 1]) != std::string::npos) b--;
-    if (a == b) return MAX_BYTES;
+    if (a == b) {
+        int hint = read_budget_hint();
+        return hint ? hint : MAX_BYTES;
+    }
     for (size_t k = a; k < b; k++)
         if (s[k] < '0' || s[k] > '9') return MAX_BYTES;
     if (b - a > 9) return BUDGET_CAP;  // 位数过多，必然越上界
@@ -130,18 +190,25 @@ static const int READ_DATA_MIN_LINES = 200;  // 数据类 Read 门槛（>200 行
 static const int READ_STRUCT_MIN_LINES = 800;
 // 硬阀：行数不多但体量巨大的（压缩成几行的 dump），不管门槛直接裁
 static const size_t READ_STRUCT_HARD_BYTES = 40000;
+// v1.3.0：文档档（.md）门槛与结构档同源；中段捞回特征换成 Markdown 标题行
+static const int READ_DOC_MIN_LINES = READ_STRUCT_MIN_LINES;
+static const size_t READ_DOC_HARD_BYTES = READ_STRUCT_HARD_BYTES;
 static const int READ_HEAD_LINES = 200;   // Read 头段行数
 static const int READ_TAIL_LINES = 120;   // Read 尾段行数
 
 // v1.2：数据类扩展名（与 hooks/trim.py 的 DATA_EXTS、hooks.json 的 if 规则同一份清单）
 static const char *DATA_EXTS[] = {
-    ".log", ".jsonl", ".ndjson", ".csv", ".tsv", ".out", ".err", ".txt", ".json",
+    ".log", ".jsonl", ".ndjson", ".csv", ".tsv", ".out", ".err", ".txt", ".json", ".md",
 };
 static const size_t DATA_EXT_COUNT = sizeof(DATA_EXTS) / sizeof(DATA_EXTS[0]);
 
 // v1.2.2：结构类（DATA_EXTS 的子集，走更高门槛）
 static const char *STRUCT_EXTS[] = {".json"};
 static const size_t STRUCT_EXT_COUNT = sizeof(STRUCT_EXTS) / sizeof(STRUCT_EXTS[0]);
+
+// v1.3.0：文档档（DATA_EXTS 的子集，门槛同结构档，中段捞标题行）
+static const char *DOC_EXTS[] = {".md"};
+static const size_t DOC_EXT_COUNT = sizeof(DOC_EXTS) / sizeof(DOC_EXTS[0]);
 
 // 判定只看扩展名（大小写不敏感），反斜杠先归一化
 static bool is_data_file(const std::string &path) {
@@ -183,6 +250,37 @@ static bool is_struct_file(const std::string &path) {
         if (p.size() >= n && p.compare(p.size() - n, n, STRUCT_EXTS[i]) == 0) return true;
     }
     return false;
+}
+
+// v1.3.0：文档档（.md）—— 属于数据类，门槛同结构档
+static bool is_doc_file(const std::string &path) {
+    std::string p = path;
+    for (size_t i = 0; i < p.size(); i++) {
+        if (p[i] == '\\') p[i] = '/';
+    }
+    const std::string trim_ws = " \t\r\n\v\f";
+    size_t a = 0, b = p.size();
+    while (a < b && trim_ws.find(p[a]) != std::string::npos) a++;
+    while (b > a && trim_ws.find(p[b - 1]) != std::string::npos) b--;
+    p = p.substr(a, b - a);
+    for (size_t i = 0; i < p.size(); i++) {
+        if (p[i] >= 'A' && p[i] <= 'Z') p[i] = (char)(p[i] - 'A' + 'a');
+    }
+    for (size_t i = 0; i < DOC_EXT_COUNT; i++) {
+        const size_t n = strlen(DOC_EXTS[i]);
+        if (p.size() >= n && p.compare(p.size() - n, n, DOC_EXTS[i]) == 0) return true;
+    }
+    return false;
+}
+
+// v1.3.0：Markdown 标题行 —— 行首 1~6 个 '#' 后紧跟空格/Tab
+// （与 hooks/trim.py 的 DOC_HEAD_PATTERN = r"^#{1,6}[ \t]" 逐字节等价；
+//   py 的 \s 是 Unicode 语义，这里刻意用 ASCII 字符类避免分叉）
+static bool is_doc_heading(const std::string &line) {
+    size_t k = 0;
+    while (k < line.size() && k < 6 && line[k] == '#') k++;
+    if (k == 0 || k >= line.size()) return false;
+    return line[k] == ' ' || line[k] == '\t';
 }
 
 // Read 模式下的「符号行」：函数 / 类 / 结构 / 导入等骨架行（全是字面量，子串匹配，
@@ -848,8 +946,45 @@ static FillPass fill_pass(const std::vector<std::string> &lines, size_t total,
     return r;
 }
 
+// v1.3.0：把未显示区切成连续段，取最长的一段，给出能直接用的 offset/limit。
+// 不用 rng_lo/rng_hi：那两个数是「所有未显示行的最小/最大值」，sampled 时几乎覆盖全文，
+// 照着读等于把原文重读一遍。只在 read_mode 下给（其他工具没有文件行号）。
+static std::string gap_hint(const std::vector<char> &shown, size_t total, bool read_mode) {
+    if (!read_mode) return "";
+    std::vector<std::pair<size_t, size_t> > runs;   // (起始下标0基, 段长)
+    size_t i = 0;
+    while (i < total) {
+        if (shown[i]) { i++; continue; }
+        size_t j = i;
+        while (j < total && !shown[j]) j++;
+        runs.push_back(std::make_pair(i, j - i));
+        i = j;
+    }
+    if (runs.empty()) return "";
+    size_t best_i = runs[0].first, best_len = runs[0].second;
+    for (size_t k = 1; k < runs.size(); k++) {
+        if (runs[k].second > best_len) {   // 并列取靠前的一段
+            best_i = runs[k].first;
+            best_len = runs[k].second;
+        }
+    }
+    if (best_len < (size_t)GAP_HINT_MIN_LINES) return "";
+    size_t lim = best_len < (size_t)GAP_HINT_MAX_LINES ? best_len : (size_t)GAP_HINT_MAX_LINES;
+    long long off = (long long)best_i + 1;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "；最长连续段第 %lld–%lld 行，可 Read offset=%lld limit=%d",
+             off, off + (long long)lim - 1, off, (int)lim);
+    std::string hint = buf;
+    if (runs.size() > 1) {
+        snprintf(buf, sizeof(buf), "（共 %d 段）", (int)runs.size());
+        hint += buf;
+    }
+    return hint;
+}
+
 static bool trim_text(const std::string &text, bool read_mode, int min_lines,
-                      bool strict_gate, size_t hard_bytes, std::string &out) {
+                      bool strict_gate, size_t hard_bytes, bool doc_mode, bool line_ok,
+                      std::string &out) {
     std::vector<std::string> lines;
     {
         size_t st = 0;
@@ -867,6 +1002,10 @@ static bool trim_text(const std::string &text, bool read_mode, int min_lines,
     const size_t total = lines.size();
     const size_t tbytes = text.size();
     const size_t budget_bytes = (size_t)resolve_budget();  // v0.3.5：可用 WB_OPS_BUDGET 覆盖
+    // 「行号可用」= 结果来自 Read：只有它才有 offset/limit。
+    // 注意不能用 read_mode 代替——read_mode 的语义是「按符号行裁剪」（源码档），
+    // 数据类/结构类 Read 走关键字模式，read_mode 为假，但它们同样是行可寻址的
+    const bool line_mode = read_mode || doc_mode || line_ok;
 
     // v1.1：已带本插件标记的文本不再二次裁剪（幂等，免得越裁越碎）
     if (text.find(MARK_OMIT) != std::string::npos ||
@@ -916,9 +1055,14 @@ static bool trim_text(const std::string &text, bool read_mode, int min_lines,
         std::string head = u8_prefix(text, budget_bytes * 5 / 8);
         std::string tail = u8_suffix(text, budget_bytes * 3 / 10);
         long long omitted = (long long)tbytes - (long long)head.size() - (long long)tail.size();
-        char buf[128];
-        snprintf(buf, sizeof(buf), "\n… [wb-ops 省略 %lld 字节] …", omitted);
+        char buf[320];
+        snprintf(buf, sizeof(buf), "\n… [wb-ops 省略 %lld 字节", omitted);
         std::string marker = buf;
+        if (line_mode) {
+            // v1.3.0：这里没有行号可用，offset/limit 是行导向的，给了反而误导
+            marker += "；行数极少但字节很大，按行跳不过去，建议 Grep -n 检索";
+        }
+        marker += "] …";
         if (looks_json(text)) {
             marker += "\n… [wb-ops 注：原文为 JSON 结构，截断后已非合法 JSON] …";
         }
@@ -927,11 +1071,15 @@ static bool trim_text(const std::string &text, bool read_mode, int min_lines,
     }
 
     // 命中统计（全文一次预计算，供候选集与标记文案复用）
-    // 普通模式认 error/warning 等关键字；Read 模式认函数/类/import 等符号行
+    // 普通模式认 error/warning 等关键字；Read 模式认函数/类/import 等符号行；
+    // 文档档认 Markdown 标题行（# ~ ######，且 # 后必须跟空白，`#tag` 不算标题）
     std::vector<char> is_key(total, 0);
     size_t hit_total = 0;
     for (size_t i = 0; i < total; i++) {
-        if (read_mode ? is_symbol_line(lines[i]) : is_key_line(lines[i])) {
+        const bool hit_i = read_mode ? is_symbol_line(lines[i])
+                          : doc_mode ? is_doc_heading(lines[i])
+                                     : is_key_line(lines[i]);
+        if (hit_i) {
             is_key[i] = 1;
             hit_total++;
         }
@@ -970,7 +1118,8 @@ static bool trim_text(const std::string &text, bool read_mode, int min_lines,
                               (long long)tail_shown.size();
     const long long silent = (long long)total - shown_n;
 
-    // v0.6.9：未显示区间的首末行号（1 基），写进标记供模型 offset 定向回查
+    // v0.6.9：未显示区间的首末行号（1 基）
+    // （v1.3.0：这两个数只用于描述「省略发生在哪一段」，回查建议走 gap_hint()）
     long long rng_lo = 0, rng_hi = 0;
     for (size_t i = 0; i < total; i++) {
         if (!shown[i]) {
@@ -978,39 +1127,44 @@ static bool trim_text(const std::string &text, bool read_mode, int min_lines,
             rng_hi = (long long)i + 1;
         }
     }
+    const std::string hint = gap_hint(shown, total, line_mode);
+
+    const char *key_word = doc_mode ? "标题行" : (read_mode ? "符号行" : "关键字行");
+    const char *hit_word = doc_mode ? "Markdown 标题"
+                          : (read_mode ? "函数/类/import 行" : "error/warning 关键字");
 
     std::vector<std::string> parts(head_shown);
-    char mbuf[320];
+    char mbuf[512];
     if (!key_shown.empty()) {
         if (sampled) {
             snprintf(mbuf, sizeof(mbuf),
-                     "… [wb-ops 省略 %lld 行（第 %lld–%lld 行），%s的 %d 条中均匀抽取 %d 条如下] …",
-                     silent, rng_lo, rng_hi, read_mode ? "命中符号" : "命中关键字",
-                     (int)pool_n, (int)key_shown.size());
+                     "… [wb-ops 省略 %lld 行（第 %lld–%lld 行），%s的 %d 条中均匀抽取 %d 条如下%s] …",
+                     silent, rng_lo, rng_hi,
+                     doc_mode ? "命中标题行" : (read_mode ? "命中符号" : "命中关键字"),
+                     (int)pool_n, (int)key_shown.size(), hint.c_str());
             parts.push_back(mbuf);
         } else {
             snprintf(mbuf, sizeof(mbuf),
                      "… [wb-ops 省略 %lld 行（第 %lld–%lld 行），以下为捞回的 %d 条%s",
-                     silent, rng_lo, rng_hi, (int)key_shown.size(),
-                     read_mode ? "符号行" : "关键字行");
+                     silent, rng_lo, rng_hi, (int)key_shown.size(), key_word);
             std::string marker = mbuf;
             if (key_shown.size() < hit_total) {
                 snprintf(mbuf, sizeof(mbuf), "（共命中 %d 条）", (int)hit_total);
                 marker += mbuf;
             }
-            marker += read_mode ? "，可加 offset 回查] …" : "] …";
+            marker += hint.empty() ? (line_mode ? "，可用 offset 回查" : "") : hint;
+            marker += "] …";
             parts.push_back(marker);
         }
     } else if (hit_total) {
         snprintf(mbuf, sizeof(mbuf),
-                 "… [wb-ops 省略 %lld 行（第 %lld–%lld 行，%s已包含在显示区域）] …",
-                 silent, rng_lo, rng_hi, read_mode ? "符号行" : "关键字行");
+                 "… [wb-ops 省略 %lld 行（第 %lld–%lld 行，%s已包含在显示区域）%s] …",
+                 silent, rng_lo, rng_hi, key_word, hint.c_str());
         parts.push_back(mbuf);
     } else {
         snprintf(mbuf, sizeof(mbuf),
-                 "… [wb-ops 省略 %lld 行（第 %lld–%lld 行，未发现 %s）] …",
-                 silent, rng_lo, rng_hi,
-                 read_mode ? "函数/类/import 行" : "error/warning 关键字");
+                 "… [wb-ops 省略 %lld 行（第 %lld–%lld 行，未发现 %s）%s] …",
+                 silent, rng_lo, rng_hi, hit_word, hint.c_str());
         parts.push_back(mbuf);
     }
     parts.insert(parts.end(), key_shown.begin(), key_shown.end());
@@ -1194,6 +1348,13 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    // v1.3.0：先记下会话 id——resolve_budget() 靠它找 ctx-guard 落的预算旁路文件
+    {
+        const JVal *sv = root.get("session_id");
+        std::string sid0 = (sv && sv->t == JVal::STR) ? sv->s : std::string("");
+        g_sid = sid0.size() > 8 ? sid0.substr(0, 8) : sid0;
+    }
+
     const JVal *tn = root.get("tool_name");
     std::string tool = (tn && tn->t == JVal::STR) ? tn->s : "";
     if (!is_trim_tool(tool)) {
@@ -1216,6 +1377,7 @@ int main(int argc, char **argv) {
     //   其余 —— 直接透传。
     bool read_mode = false;
     bool strict_gate = false;   // v1.2.2：结构类用「两项都过线」的严格门槛
+    bool doc_mode = false;      // v1.3.0：文档档（.md），中段捞回标题行
     size_t hard_bytes = 0;      // v1.2.2：结构类体量硬阀
     int min_lines = MAX_LINES;
     if (tool == "Read") {
@@ -1234,6 +1396,12 @@ int main(int argc, char **argv) {
                 min_lines = READ_STRUCT_MIN_LINES;
                 strict_gate = true;
                 hard_bytes = READ_STRUCT_HARD_BYTES;
+            } else if (is_doc_file(path)) {
+                // 门槛与结构档一致，只是中段捞回特征不同（文档没有 error 关键字）
+                min_lines = READ_DOC_MIN_LINES;
+                strict_gate = true;
+                hard_bytes = READ_DOC_HARD_BYTES;
+                doc_mode = true;
             } else {
                 min_lines = READ_DATA_MIN_LINES;
             }
@@ -1249,7 +1417,8 @@ int main(int argc, char **argv) {
         trace(std::string("工具 ") + tool + " 失败（结构化或文本信号），保留完整输出，透传");
         return 0;
     }
-    if (!trim_text(text, read_mode, min_lines, strict_gate, hard_bytes, trimmed)) {
+    if (!trim_text(text, read_mode, min_lines, strict_gate, hard_bytes, doc_mode,
+                   tool == "Read", trimmed)) {
         trace(std::string("\xe5\xb7\xa5\xe5\x85\xb7 ") + tool +
               " \xe8\xbe\x93\xe5\x87\xba\xe4\xb8\x8d\xe9\x95\xbf\xef\xbc\x8c\xe4\xb8\x8d\xe8\xa3\x81");
         return 0;

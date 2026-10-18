@@ -1,5 +1,5 @@
 {
-  "description": "wb-ops 1.2.2: 工具输出压缩（Grep/Glob/WebFetch + Read 数据类文件）+ 记忆守卫（SessionStart）+ 上下文守卫 v2（UserPromptSubmit）+ 压缩指令注入（PreCompact）。v1.2：Read 首次纳入默认裁剪，但只针对数据类文件（v1.2.2 加 .json，门槛 800 行）（PostToolUse 第二组的 if=\"Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt,json})\"；宿主在 spawn 前按 tool_input.file_path 做 glob 判定，源码文件命中不了 → hook 根本不启动，零开销零风险）。数据类走普通关键字行 + 200 行门槛（.json 结构类例外：行数 > 800 且字节超预算才裁，另有 40KB 体量硬阀——读 json 多是为了接着 Edit，中段断掉要补读，省下的白赔）；源码类要装时加 --with-read（它把 WB_OPS_READ_TRIM=1 直接写进该组命令，不必用户再手动设）才进 matcher，门槛 1500 行且按符号行裁剪。v1.1：PostToolUse matcher 摘掉 Bash —— 宿主 tool_response 对 Bash 只给元数据（exitCode/stdoutBytesTruncated…），正文不在载荷里，hook 无从裁剪，命中一次只白付约 270ms 进程开销（实测 bash+exe 273ms/次、裸 exe 64ms/次）；同轮修复：结构化失败信号（is_error / exitCode≠0 / tool_error_code / error）整段透传、头尾行数改按平均行长自适应并扩张填满预算（利用率 58%→93%+）、裁剪结果含 wb-ops 标记时不再二次裁剪、JSON 原文截断加显式提示、账本过滤无 session_id 与 test/bench/probe 探头记录。v0.6.6：每条命令取到插件根后先把反斜杠归一化为正斜杠（宿主注入全反斜杠路径会让 node 守卫静默不执行）。v0.6.5：解释器候选路径从插件根推导宿主根，不再硬编码。警告：不要再给本文件加 modules 入口——主动压缩督导会与宿主轮末 Gate 抢跑，导致本轮结果被丢弃、UI 永久“思考中”（v0.6.8 已移除，mod/supervisor.mjs 另需 WB_OPS_COMPACT_UNSAFE=1 才可能压缩）。",
+  "description": "wb-ops 1.3.0: 工具输出压缩（Grep/Glob/WebFetch + Read 数据类/文档类文件）+ 记忆守卫（SessionStart）+ 上下文守卫 v2（UserPromptSubmit）+ 压缩指令注入（PreCompact）。v1.3.0：① 省略标记改附「最长连续空洞」的取回方式（Read offset/limit≤180，空洞<20 行不给；单行超长型建议 Grep -n）；② 预算按上下文水位动态收缩（ctx-guard 写 <sid8>.num 纯整数旁路文件，trim 侧只 atoi + 范围校验，零 parity 面）；③ .md 单开文档档，门槛同结构档（800 行且超预算 + 40KB 硬阀），中段改捞 Markdown 标题行（^#{1,6} 后接空白）；④ ctx-guard 状态与预算文件原子写。v1.2.2: 工具输出压缩（Grep/Glob/WebFetch + Read 数据类文件）+ 记忆守卫（SessionStart）+ 上下文守卫 v2（UserPromptSubmit）+ 压缩指令注入（PreCompact）。v1.2：Read 首次纳入默认裁剪，但只针对数据类文件（v1.2.2 加 .json，门槛 800 行）（PostToolUse 第二组的 if=\"Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt,json,md})\"；宿主在 spawn 前按 tool_input.file_path 做 glob 判定，源码文件命中不了 → hook 根本不启动，零开销零风险）。数据类走普通关键字行 + 200 行门槛；源码类要装时加 --with-read（它把 WB_OPS_READ_TRIM=1 直接写进该组命令，不必用户再手动设）才进 matcher，门槛 1500 行且按符号行裁剪。v1.1：PostToolUse matcher 摘掉 Bash —— 宿主 tool_response 对 Bash 只给元数据（exitCode/stdoutBytesTruncated…），正文不在载荷里，hook 无从裁剪，命中一次只白付约 270ms 进程开销（实测 bash+exe 273ms/次、裸 exe 64ms/次）；同轮修复：结构化失败信号（is_error / exitCode≠0 / tool_error_code / error）整段透传、头尾行数改按平均行长自适应并扩张填满预算（利用率 58%→93%+）、裁剪结果含 wb-ops 标记时不再二次裁剪、JSON 原文截断加显式提示、账本过滤无 session_id 与 test/bench/probe 探头记录。v0.6.6：每条命令取到插件根后先把反斜杠归一化为正斜杠（宿主注入全反斜杠路径会让 node 守卫静默不执行）。v0.6.5：解释器候选路径从插件根推导宿主根，不再硬编码。警告：不要再给本文件加 modules 入口——主动压缩督导会与宿主轮末 Gate 抢跑，导致本轮结果被丢弃、UI 永久“思考中”（v0.6.8 已移除，mod/supervisor.mjs 另需 WB_OPS_COMPACT_UNSAFE=1 才可能压缩）。",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -36,7 +36,7 @@
       },
       {
         "matcher": "Read",
-        "if": "Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt,json})",
+        "if": "Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt,json,md})",
         "hooks": [
           {
             "type": "command",
