@@ -64,7 +64,7 @@ tmp = tempfile.mkdtemp(prefix="wbops-selfcheck-")
 home = os.path.join(tmp, "home")
 env = {"WB_OPS_HOST_HOME": home, "WB_OPS_STATS": "0"}
 
-print("自检 1.1.0（临时宿主 %s）" % home.replace(tmp, "<tmp>"))
+print("自检 1.2.0（临时宿主 %s）" % home.replace(tmp, "<tmp>"))
 r = run([PY, os.path.join(ROOT, "install_wb_ops.py"), "install"], env=env)
 ck("install 退出码 0", r.returncode == 0, "rc=%d" % r.returncode)
 

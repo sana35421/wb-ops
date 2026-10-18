@@ -19,7 +19,7 @@ WorkBuddy 通过三个注册表文件管理插件，本脚本按它们的实际�
 
 可选参数：
     --marketplace NAME   自定义市场名（默认 local；卸载 / status / gc 须用同一名字）
-    --with-read          把 Read 写进 PostToolUse matcher（默认不启用；仍需设 WB_OPS_READ_TRIM=1）
+    --with-read          Read 从「只裁数据类文件」扩到「所有文件」（数据类默认就裁，源码默认不裁）
 """
 
 import json
@@ -62,12 +62,16 @@ PLUGINS = os.path.join(WB, "plugins")
 MARKETPLACE = "local"   # 市场名；可用 --marketplace NAME 覆盖
 PLUGIN = "wb-ops"
 PLUGIN_ID = "%s@%s" % (PLUGIN, MARKETPLACE)
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 BACKUP_SUFFIX = ".bak-2026-10-15-wbops"
 
-# PostToolUse matcher（v1.1 收紧，详见 apply_read_matcher 的说明）
+# PostToolUse 两组（v1.2 起）：普通工具一组，Read 数据类文件一组（带 if 条件）
 MATCHER_DEFAULT = "Grep|Glob|WebFetch"
-MATCHER_WITH_READ = "Grep|Glob|WebFetch|Read"
+READ_MATCHER = "Read"
+# 与 hooks.json 的 if 规则、hooks/trim.py 的 DATA_EXTS、src/trim.cpp 的 DATA_EXTS
+# 必须保持同一份清单：宿主在 spawn 前用这条 glob 判定，命中不了的 Read 零开销
+READ_IF_DEFAULT = "Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt})"
+READ_ENV_EXPORT = "export WB_OPS_READ_TRIM=1; "
 
 MARKET_DIR = os.path.join(PLUGINS, "marketplaces", MARKETPLACE)
 PLUGIN_DIR = os.path.join(MARKET_DIR, "plugins", PLUGIN)
@@ -133,20 +137,23 @@ def write_json(path, data, backup=True):
 
 
 def want_read():
-    """是否把 Read 装进 PostToolUse matcher（`--with-read`）。"""
+    """是否把 Read 裁剪从「仅数据类文件」扩到「所有文件」（`--with-read`）。"""
     return "--with-read" in sys.argv
 
 
 def apply_read_matcher(*roots):
-    """v1.1：`--with-read` 时把已落盘的 hooks.json 的 PostToolUse matcher 扩到含 Read。
+    """v1.2：`--with-read` = Read 从「只裁数据类文件」扩到「所有文件」。
 
-    默认 matcher 只有 Grep|Glob|WebFetch，理由：
-      · Bash 摘除 —— 宿主对 Bash 的 tool_response 只给元数据（exitCode 等），
-        正文不在载荷里，hook 拿不到任何可裁剪文本，命中一次只白付约 270ms 进程开销
-        （实测 bash+exe 273ms/次 vs 裸 exe 64ms/次）。
-      · Read 摘除 —— Read 裁剪默认关闭（要 WB_OPS_READ_TRIM=1 才生效），
-        为默认关闭的功能在每次读文件时白付 270ms 不划算，改为安装期显式开启；
-        开启后仍受 >1500 行门槛保护。
+    默认（不加 --with-read）就已经会裁数据类文件：hooks.json 的 PostToolUse 第二组是
+        {"matcher": "Read", "if": "Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt})"}
+    宿主在 spawn 之前就按 tool_input.file_path 做了 glob 判定，源码文件命不中 →
+    hook 根本不启动，所以「数据类默认开」不产生任何空跑开销。
+
+    --with-read 只改落盘的 hooks.json（不碰用户环境变量），做两件事：
+      · 去掉该组的 if 条件 → 所有 Read 都进 hook；
+      · 在命令前面加 export WB_OPS_READ_TRIM=1 → trim.py / trim.cpp 才走源码档
+        （1500 行门槛 + 符号行）；少了这句，源码文件会整段透传、白付一次进程开销。
+    幂等：重复执行不会叠加 export（先查子串再拼）。
     """
     for root in roots:
         path = os.path.join(root, "hooks", "hooks.json")
@@ -155,18 +162,23 @@ def apply_read_matcher(*roots):
                 data = json.load(f)
             hit = 0
             for group in data.get("hooks", {}).get("PostToolUse", []):
-                if group.get("matcher") == MATCHER_DEFAULT:
-                    group["matcher"] = MATCHER_WITH_READ
-                    hit += 1
+                if group.get("matcher") != READ_MATCHER:
+                    continue
+                group.pop("if", None)
+                for hook in group.get("hooks", []):
+                    cmd = hook.get("command") or ""
+                    if "WB_OPS_READ_TRIM" not in cmd:
+                        hook["command"] = READ_ENV_EXPORT + cmd
+                hit += 1
             if not hit:
-                print("  ! %s 的 matcher 不是默认值，未改动" % path)
+                print("  ! 没找到 Read 那组 hook，--with-read 未生效（%s）" % path)
                 continue
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
                 f.write("\n")
-            print("  + matcher -> %s（还需设 WB_OPS_READ_TRIM=1 才真正裁剪）" % MATCHER_WITH_READ)
+            print("  + Read 组已去掉 if 条件并写入 WB_OPS_READ_TRIM=1（源码文件也裁：>1500 行、按符号行）")
         except Exception as e:
-            print("  ! 修改 matcher 失败（%s）：%s" % (path, e))
+            print("  ! 修改 hooks.json 失败（%s）：%s" % (path, e))
 
 
 def sync():

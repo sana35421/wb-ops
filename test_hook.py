@@ -112,14 +112,16 @@ def run_ctx_guard(payload, state_dir, extra_env=None):
     return proc.stdout.strip(), proc.returncode
 
 
-def run_hook(payload):
+def run_hook(payload, extra_env=None):
     """把 payload 喂给 hook，返回 (stdout, 返回码)。"""
+    env = dict(os.environ, **extra_env) if extra_env else None
     proc = subprocess.run(
         [sys.executable, HOOK],
         input=json.dumps(payload, ensure_ascii=False),
         capture_output=True,
         text=True,
         encoding="utf-8",
+        env=env,
     )
     return proc.stdout.strip(), proc.returncode
 
@@ -190,6 +192,81 @@ def main():
         else:
             print("[1b] 失败透传 %-16s FAIL  失败输出被裁剪，报错现场丢失" % label)
             ok = False
+    print()
+
+    # ---- 用例 1c（v1.2）：Read 按文件类型分档 ----
+    log_lines = []
+    for i in range(600):
+        if i == 333:
+            log_lines.append("ERROR connect timeout after 30s")
+        else:
+            log_lines.append("2026-10-17 10:%02d:%02d INFO request id=%d" % (i // 60, i % 60, i))
+    log_text = "\n".join(log_lines)
+    src_text = "\n".join(("def f_%d(x):" % i if i % 300 == 0 else "    b_%d = compute(x)" % i)
+                         for i in range(2000))
+    for label, resp, tin, env, want in (
+        ("数据类 .log", log_text, {"file_path": "C:/tmp/a.log"}, {}, True),
+        ("数据类短文件", "\n".join(log_lines[:80]), {"file_path": "C:/tmp/a.log"}, {}, False),
+        ("源码 .py 默认", src_text, {"file_path": "C:/tmp/a.py"}, {}, False),
+        ("源码 .py 开闸", src_text, {"file_path": "C:/tmp/a.py"}, {"WB_OPS_READ_TRIM": "1"}, True),
+    ):
+        out, code = run_hook(
+            {"hook_event_name": "PostToolUse", "tool_name": "Read",
+             "tool_input": tin, "tool_response": resp},
+            env,
+        )
+        if code != 0:
+            print("[1c] Read %-12s FAIL  返回码 %s" % (label, code))
+            ok = False
+            continue
+        if not want:
+            status = "PASS" if out == "" else "FAIL  不应裁剪却裁了"
+            if out:
+                ok = False
+            print("[1c] Read %-12s %s" % (label, status))
+            continue
+        try:
+            body = json.loads(out)["hookSpecificOutput"]["updatedToolOutput"]
+        except Exception:
+            print("[1c] Read %-12s FAIL  输出无法解析：%r" % (label, out[:80]))
+            ok = False
+            continue
+        keep = ("connect timeout" in body) if label.startswith("数据类") else ("def f_0" in body)
+        mark = "wb-ops" in body
+        ratio = 1 - len(body) / max(len(resp), 1)
+        status = "PASS" if (keep and mark and ratio > 0.5) else "FAIL  关键字/标记/压缩率不符"
+        if status != "PASS":
+            ok = False
+        print("[1c] Read %-12s 原 %d -> %d 字符（省 %.0f%%）  关键行 %s  标记 %s  %s"
+              % (label, len(resp), len(body), ratio * 100, keep, mark, status))
+    print()
+
+    # ---- 用例 1d（v1.2）：hooks.json 的 if 扩展名清单必须与 trim.py 的 DATA_EXTS 同源 ----
+    # 三处（hooks.json / trim.py / trim.cpp）任一漂移，都会出现「hook 不启动」或
+    # 「启动了却按源码档处理」的静默错配，故在此做一次硬校验。
+    sys.path.insert(0, os.path.join(PLUGIN, "hooks"))
+    import trim as trim_mod
+    with open(os.path.join(PLUGIN, "hooks", "hooks.json"), encoding="utf-8") as f:
+        hk = json.load(f)
+    post = hk["hooks"]["PostToolUse"]
+    read_groups = [g for g in post if g.get("matcher") == "Read"]
+    checks = []
+    checks.append(("有独立的 Read 组", len(read_groups) == 1))
+    if read_groups:
+        rule = read_groups[0].get("if") or ""
+        checks.append(("Read 组带 if 条件", rule.startswith("Read(*.{") and rule.endswith("})")))
+        ext_in_rule = tuple("." + x for x in rule[len("Read(*.{"):-2].split(","))
+        checks.append(("if 清单 == DATA_EXTS", ext_in_rule == trim_mod.DATA_EXTS))
+        checks.append(("默认不带 WB_OPS_READ_TRIM",
+                       all("WB_OPS_READ_TRIM" not in (h.get("command") or "")
+                           for h in read_groups[0].get("hooks", []))))
+    # 普通工具那组仍在，且没被顺手塞进 Read
+    checks.append(("普通组 matcher 未含 Read",
+                   any(g.get("matcher") == "Grep|Glob|WebFetch" for g in post)))
+    for name, good in checks:
+        if not good:
+            ok = False
+        print("[1d] %-28s %s" % (name, "PASS" if good else "FAIL"))
     print()
 
     # ---- 用例 2：小输出应原样透传 ----

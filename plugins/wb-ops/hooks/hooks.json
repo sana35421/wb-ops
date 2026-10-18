@@ -1,5 +1,5 @@
 {
-  "description": "wb-ops 1.1.0: 工具输出压缩（默认 Grep/Glob/WebFetch；Read 需 --with-read 装进 matcher 且 WB_OPS_READ_TRIM=1 才启用）+ 记忆守卫（SessionStart）+ 上下文守卫 v2（UserPromptSubmit）+ 压缩指令注入（PreCompact）。v1.1：PostToolUse matcher 摘掉 Bash —— 宿主 tool_response 对 Bash 只给元数据（exitCode/stdoutBytesTruncated…），正文不在载荷里，hook 无从裁剪，命中一次只白付约 270ms 进程开销（实测 bash+exe 273ms/次、裸 exe 64ms/次）；同轮修复：结构化失败信号（is_error / exitCode≠0 / tool_error_code / error）整段透传、头尾行数改按平均行长自适应并扩张填满预算（利用率 58%→93%+）、裁剪结果含 wb-ops 标记时不再二次裁剪、JSON 原文截断加显式提示、账本过滤无 session_id 与 test/bench/probe 探头记录。v0.6.6：每条命令取到插件根后先把反斜杠归一化为正斜杠（宿主注入全反斜杠路径会让 node 守卫静默不执行）。v0.6.5：解释器候选路径从插件根推导宿主根，不再硬编码。警告：不要再给本文件加 modules 入口——主动压缩督导会与宿主轮末 Gate 抢跑，导致本轮结果被丢弃、UI 永久“思考中”（v0.6.8 已移除，mod/supervisor.mjs 另需 WB_OPS_COMPACT_UNSAFE=1 才可能压缩）。",
+  "description": "wb-ops 1.2.0: 工具输出压缩（Grep/Glob/WebFetch + Read 数据类文件）+ 记忆守卫（SessionStart）+ 上下文守卫 v2（UserPromptSubmit）+ 压缩指令注入（PreCompact）。v1.2：Read 首次纳入默认裁剪，但只针对数据类文件（PostToolUse 第二组的 if=\"Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt})\"；宿主在 spawn 前按 tool_input.file_path 做 glob 判定，源码文件命中不了 → hook 根本不启动，零开销零风险）。数据类走普通关键字行 + 200 行门槛；源码类要装时加 --with-read（它把 WB_OPS_READ_TRIM=1 直接写进该组命令，不必用户再手动设）才进 matcher，门槛 1500 行且按符号行裁剪。v1.1：PostToolUse matcher 摘掉 Bash —— 宿主 tool_response 对 Bash 只给元数据（exitCode/stdoutBytesTruncated…），正文不在载荷里，hook 无从裁剪，命中一次只白付约 270ms 进程开销（实测 bash+exe 273ms/次、裸 exe 64ms/次）；同轮修复：结构化失败信号（is_error / exitCode≠0 / tool_error_code / error）整段透传、头尾行数改按平均行长自适应并扩张填满预算（利用率 58%→93%+）、裁剪结果含 wb-ops 标记时不再二次裁剪、JSON 原文截断加显式提示、账本过滤无 session_id 与 test/bench/probe 探头记录。v0.6.6：每条命令取到插件根后先把反斜杠归一化为正斜杠（宿主注入全反斜杠路径会让 node 守卫静默不执行）。v0.6.5：解释器候选路径从插件根推导宿主根，不再硬编码。警告：不要再给本文件加 modules 入口——主动压缩督导会与宿主轮末 Gate 抢跑，导致本轮结果被丢弃、UI 永久“思考中”（v0.6.8 已移除，mod/supervisor.mjs 另需 WB_OPS_COMPACT_UNSAFE=1 才可能压缩）。",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -26,6 +26,17 @@
     "PostToolUse": [
       {
         "matcher": "Grep|Glob|WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "R=\"${CODEBUDDY_PLUGIN_ROOT}\"; R=\"${R//\\\\\\\\//}\"; H=\"${R%%/plugins/cache/*}\"; [ -f \"$R/bin/TRACE-ON\" ] && export WB_OPS_TRACE=1; E=\"$R/bin/wb-ops-trim.exe\"; if [ -x \"$E\" ]; then \"$E\"; else for PY in \"$(command -v python)\" \"$(command -v python3)\" \"$H\"/binaries/python/versions/*/python.exe \"/c/Python314/python.exe\"; do [ -n \"$PY\" ] && [ -x \"$PY\" ] && \"$PY\" \"$R/hooks/trim.py\" && break; done; fi; exit 0",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "if": "Read(*.{log,jsonl,ndjson,csv,tsv,out,err,txt})",
         "hooks": [
           {
             "type": "command",

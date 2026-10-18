@@ -193,9 +193,9 @@ def build_cases():
         "\nStderr: a.cpp:3: error: x was not declared\nExit Code: 1\nSignal: (none)"
     cases.append(("Bash 字符串 Exit Code 1（透传）", "Bash", bash_bad))
 
-    # 32. Read 默认关闭 —— 长文件也原样透传（受 WB_OPS_READ_TRIM 控制）
+    # 32. Read 默认关闭 —— 非数据类文件（无路径 / 源码）长文件也原样透传
     read_text = "\n".join("    body_line_%d = compute(x) + 1" % i for i in range(2000))
-    cases.append(("Read 默认关闭（透传）", "Read", read_text))
+    cases.append(("Read 非数据类且无路径（透传）", "Read", read_text))
 
     # 33. Read 开启：>1500 行才生效，保留首尾 + 符号行
     rd = []
@@ -209,14 +209,51 @@ def build_cases():
     rng[200] = "ERROR: boom"
     cases.append(("省略标记含行号区间", "Grep", rng))
 
+    # ---- v1.2 新增：Read 按文件类型分档 ----
+    log_lines = []
+    for i in range(600):
+        if i in (120, 430):
+            log_lines.append("2026-10-17 12:%02d:%02d ERROR connect timeout" % (i // 60, i % 60))
+        else:
+            log_lines.append("2026-10-17 12:%02d:%02d INFO  handled request id=%d"
+                             % (i // 60, i % 60, i))
+
+    # 35. 数据类 .log：普通关键字模式 + 200 行门槛 —— 应裁剪
+    cases.append(("Read .log 数据类（裁剪）", "Read", "\n".join(log_lines),
+                  {}, {"file_path": "D:/tmp/service.log"}))
+
+    # 36. 数据类但只有 120 行 —— 门槛未达，透传
+    cases.append(("Read .log 未达 200 行（透传）", "Read", "\n".join(log_lines[:120]),
+                  {}, {"file_path": "D:/tmp/short.log"}))
+
+    # 37. 源码类 .py 2000 行、没设 WB_OPS_READ_TRIM —— 透传（源码要完整读）
+    src = []
+    for i in range(2000):
+        src.append("def func_%d(x):" % i if i % 300 == 0 else "    body_%d = compute(x)" % i)
+    src = "\n".join(src)
+    cases.append(("Read .py 未开 --with-read（透传）", "Read", src,
+                  {}, {"file_path": "D:/tmp/module.py"}))
+
+    # 38. 同文件 + WB_OPS_READ_TRIM=1 —— 走符号行档
+    cases.append(("Read .py 开 --with-read（符号行）", "Read", src,
+                  {"WB_OPS_READ_TRIM": "1"}, {"file_path": "D:/tmp/module.py"}))
+
+    # 39. 大写扩展名 + 反斜杠路径（ext 判定与宿主 glob 都要求大小写不敏感）
+    cases.append(("Read .LOG 大写扩展名（裁剪）", "Read", "\n".join(log_lines),
+                  {}, {"file_path": "D:\\tmp\\SERVICE.LOG"}))
+
+    # 40. tool_input 用 path 键而非 file_path（不同工具键名不同，两个都要认）
+    cases.append(("Read tool_input.path 键（裁剪）", "Read", "\n".join(log_lines),
+                  {}, {"path": "D:/tmp/other.jsonl"}))
+
     return cases
 
 
-def make_payload(tool, response, event="PostToolUse"):
+def make_payload(tool, response, event="PostToolUse", tool_input=None):
     obj = {
         "hook_event_name": event,
         "tool_name": tool,
-        "tool_input": {},
+        "tool_input": tool_input or {},
         "tool_response": response,
     }
     return json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -493,13 +530,14 @@ def main():
     for case in cases:
         name, tool, resp = case[0], case[1], case[2]
         extra_env = case[3] if len(case) > 3 else {}
+        tool_input = case[4] if len(case) > 4 else {}
         event = "PostToolUse"
-        payload = make_payload(tool, resp, event)
+        payload = make_payload(tool, resp, event, tool_input)
         # 事件名测试用例需要特殊处理
         if "事件名不对" in name:
-            payload = make_payload(tool, resp, "PreToolUse")
-        env = dict(ENV_NO_STATS, **extra_env)
+            payload = make_payload(tool, resp, "PreToolUse", tool_input)
 
+        env = dict(ENV_NO_STATS, **extra_env)
         r_py = run([PYTHON, PY_SCRIPT], payload, env)
         r_ex = run([EXE], payload, env)
         n_py = normalize(r_py)
@@ -640,14 +678,10 @@ def main():
     print("  原生版  （裸 exe 直调）     : %7.1f ms" % t_ex)
     print("  提速                        : %7.1f 倍" % (t_py / t_ex if t_ex else 0))
 
-    # 模拟 hook 真实调用（经 bash 包装）；bash 定位：系统 PATH -> WorkBuddy 便携版
-    bash = shutil.which("bash") or ""
-    if not bash:
-        _g = glob.glob(os.path.join(os.path.expanduser("~"), ".workbuddy", "binaries",
-                                    "PortableGit", "versions", "*", "bin", "bash.exe"))
-        bash = _g[0] if _g else ""
-    if bash and os.path.exists(bash):
-        root_msys = to_msys(PLUGIN)  # 永远指向当前所在的这份代码（插件本体），不再硬编码旧路径
+    # 模拟 hook 真实调用（经 bash 包装）
+    bash = r"C:\Users\Administrator\.workbuddy\binaries\PortableGit\versions\1.3.0\bin\bash.exe"
+    if os.path.exists(bash):
+        root_msys = to_msys(PLUGIN)  # 永远指向当前所在的这份代码，不再硬编码旧路径
         cmd_new = '"%s/bin/wb-ops-trim.exe" 2>/dev/null || exit 0' % root_msys
         env = {"CODEBUDDY_PLUGIN_ROOT": root_msys, "PATH": "/usr/bin:/bin",
                "TMP": "/tmp", "WB_OPS_STATS": "0"}
@@ -660,7 +694,7 @@ def main():
 
         cmd_old = ('for PY in "$(command -v python)" "%s"; do [ -n "$PY" ] && [ -x "$PY" ] '
                    '&& "$PY" "%s/hooks/trim.py" && break; done; exit 0'
-                   % (to_msys(PYTHON), root_msys))
+                   % ("/c/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.exe", root_msys))
         subprocess.run([bash, "-c", cmd_old], input=payload, capture_output=True, env=env)
         t0 = time.perf_counter()
         for _ in range(N):

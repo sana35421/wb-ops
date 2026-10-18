@@ -118,10 +118,40 @@ static const char *TRIM_TOOLS[] = {"Bash", "Grep", "Glob", "Read", "WebFetch"};
 static const size_t TRIM_TOOL_COUNT = sizeof(TRIM_TOOLS) / sizeof(TRIM_TOOLS[0]);
 
 // ---- v0.6.9 ----
-// Read 是源码，默认不裁；只有显式 WB_OPS_READ_TRIM=1 且文件足够长时才走「头 + 尾 + 符号行」。
-static const int READ_MIN_LINES = 1500;   // Read 小于这么多行一律不裁
+// Read 分两档（v1.2）：
+//   数据类（.log/.jsonl/.csv…）—— 低门槛 + 关键字行，hooks.json 的 if 规则直接放行；
+//   源码类 —— 仍然只有显式 WB_OPS_READ_TRIM=1 且文件足够长时才走「头 + 尾 + 符号行」。
+static const int READ_MIN_LINES = 1500;   // 源码类 Read 小于这么多行一律不裁
+static const int READ_DATA_MIN_LINES = 200;  // 数据类 Read 门槛（>200 行或超预算就裁）
 static const int READ_HEAD_LINES = 200;   // Read 头段行数
 static const int READ_TAIL_LINES = 120;   // Read 尾段行数
+
+// v1.2：数据类扩展名（与 hooks/trim.py 的 DATA_EXTS、hooks.json 的 if 规则同一份清单）
+static const char *DATA_EXTS[] = {
+    ".log", ".jsonl", ".ndjson", ".csv", ".tsv", ".out", ".err", ".txt",
+};
+static const size_t DATA_EXT_COUNT = sizeof(DATA_EXTS) / sizeof(DATA_EXTS[0]);
+
+// 判定只看扩展名（大小写不敏感），反斜杠先归一化
+static bool is_data_file(const std::string &path) {
+    std::string p = path;
+    for (size_t i = 0; i < p.size(); i++) {
+        if (p[i] == '\\') p[i] = '/';
+    }
+    const std::string trim_ws = " \t\r\n\v\f";
+    size_t a = 0, b = p.size();
+    while (a < b && trim_ws.find(p[a]) != std::string::npos) a++;
+    while (b > a && trim_ws.find(p[b - 1]) != std::string::npos) b--;
+    p = p.substr(a, b - a);
+    for (size_t i = 0; i < p.size(); i++) {
+        if (p[i] >= 'A' && p[i] <= 'Z') p[i] = (char)(p[i] - 'A' + 'a');
+    }
+    for (size_t i = 0; i < DATA_EXT_COUNT; i++) {
+        const size_t n = strlen(DATA_EXTS[i]);
+        if (p.size() >= n && p.compare(p.size() - n, n, DATA_EXTS[i]) == 0) return true;
+    }
+    return false;
+}
 
 // Read 模式下的「符号行」：函数 / 类 / 结构 / 导入等骨架行（全是字面量，子串匹配，
 // 与 hooks/trim.py 的 SYMBOLS 逐项一致，保 parity）
@@ -786,7 +816,8 @@ static FillPass fill_pass(const std::vector<std::string> &lines, size_t total,
     return r;
 }
 
-static bool trim_text(const std::string &text, bool read_mode, std::string &out) {
+static bool trim_text(const std::string &text, bool read_mode, int min_lines,
+                      std::string &out) {
     std::vector<std::string> lines;
     {
         size_t st = 0;
@@ -811,11 +842,12 @@ static bool trim_text(const std::string &text, bool read_mode, std::string &out)
         return false;
     }
 
-    // 触发条件：普通工具「行数 > 120 或字节 > 预算」；Read 只认长文件（行数 > 1500 且字节超预算）
+    // 触发条件：普通工具「行数 > min_lines 且字节不超预算」直接放过；
+    // Read 模式只要「行数 <= min_lines」或「字节不超预算」就放过（长文件才裁）
     if (!read_mode) {
-        if ((int)total <= MAX_LINES && tbytes <= budget_bytes) return false;  // 不长，不动
+        if ((int)total <= min_lines && tbytes <= budget_bytes) return false;  // 不长，不动
     } else {
-        if (total <= (size_t)READ_MIN_LINES || tbytes <= budget_bytes) return false;
+        if (total <= (size_t)min_lines || tbytes <= budget_bytes) return false;
     }
 
     // v1.1：头尾行数按平均行长估，再在下面按预算扩张
@@ -1115,16 +1147,37 @@ int main() {
     }
 
     std::string trimmed;
-    const bool read_mode = (tool == "Read") && env_flag("WB_OPS_READ_TRIM");
-    if (tool == "Read" && !read_mode) {
-        trace("Read 未开启按需裁剪（WB_OPS_READ_TRIM!=1），透传");
-        return 0;
+    // v1.2：Read 按文件类型分档（与 hooks/trim.py 的 main() 同构）
+    //   数据类（日志/表格/清单）—— 普通关键字模式，200 行门槛；
+    //   源码类 —— 符号行模式，1500 行门槛，需 WB_OPS_READ_TRIM=1（由 --with-read 写入命令）；
+    //   其余 —— 直接透传。
+    bool read_mode = false;
+    int min_lines = MAX_LINES;
+    if (tool == "Read") {
+        std::string path;
+        const JVal *ti = root.get("tool_input");
+        if (ti && ti->t == JVal::OBJ) {
+            static const char *PKEYS[] = {"file_path", "path"};
+            for (size_t k = 0; k < 2 && path.empty(); k++) {
+                const JVal *v = ti->get(PKEYS[k]);
+                if (v && v->t == JVal::STR && !v->s.empty()) path = v->s;
+            }
+        }
+        if (is_data_file(path)) {
+            min_lines = READ_DATA_MIN_LINES;
+        } else if (env_flag("WB_OPS_READ_TRIM")) {
+            read_mode = true;
+            min_lines = READ_MIN_LINES;
+        } else {
+            trace(std::string("Read 非数据文件且未开启 WB_OPS_READ_TRIM，透传 | ") + path.substr(0, 200));
+            return 0;
+        }
     }
     if (resp_failed(root.get("tool_response")) || text_failed(text)) {
         trace(std::string("工具 ") + tool + " 失败（结构化或文本信号），保留完整输出，透传");
         return 0;
     }
-    if (!trim_text(text, read_mode, trimmed)) {
+    if (!trim_text(text, read_mode, min_lines, trimmed)) {
         trace(std::string("\xe5\xb7\xa5\xe5\x85\xb7 ") + tool +
               " \xe8\xbe\x93\xe5\x87\xba\xe4\xb8\x8d\xe9\x95\xbf\xef\xbc\x8c\xe4\xb8\x8d\xe8\xa3\x81");
         return 0;

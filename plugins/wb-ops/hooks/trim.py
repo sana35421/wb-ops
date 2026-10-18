@@ -61,8 +61,12 @@ FILL_TARGET_PCT = 85    # 预算利用率目标：低于这个就放大头尾，
 MARK_OMIT = "[wb-ops 省略"
 MARK_TAIL = "[wb-ops 以下为原文末尾"
 
-# ---- v0.6.9：Read 按需裁剪（默认关闭）----
-READ_MIN_LINES = 1500   # Read 小于这么多行一律不裁（源码要完整读）
+# ---- v0.6.9：Read 按需裁剪（v1.2 起按文件类型分档）----
+READ_MIN_LINES = 1500   # 源码类 Read 小于这么多行一律不裁（源码要完整读）
+# v1.2：数据类文件（日志/表格/清单）走「低门槛 + 关键字行」，不需要 WB_OPS_READ_TRIM。
+# hooks.json 用 if="Read(*.{log,jsonl,…})" 精确限定，源码文件不会触发 hook（零开销）。
+READ_DATA_MIN_LINES = 200   # 数据类 Read 的门槛（>200 行或超预算就裁，与普通工具同语义）
+DATA_EXTS = (".log", ".jsonl", ".ndjson", ".csv", ".tsv", ".out", ".err", ".txt")
 # v1.1：Read 的头尾行数也走自适应（见 READ_HEAD_MIN/READ_HEAD_MAX 等）
 
 # Read 模式下的「符号行」：函数 / 类 / 结构 / 导入等骨架行
@@ -73,6 +77,17 @@ SYMBOLS = ("#include", "function ", "def ", "class ", "struct ", "namespace ",
 
 def is_symbol_line(line):
     return any(sym in line for sym in SYMBOLS)
+
+
+def is_data_file(path):
+    """v1.2：Read 的目标是不是「数据类」文件（日志 / 表格 / 清单）。
+
+    数据类文件的特点是：没有函数/类骨架行，但中段常有 error/timeout 之类的关键行，
+    所以走普通模式（关键字行）+ 低行数门槛，而不是源码模式（符号行）。
+    判定只看扩展名（大小写不敏感），与 hooks.json 的 if 规则保持同一份清单。
+    """
+    p = (path or "").strip().lower().replace("\\", "/")
+    return p.endswith(DATA_EXTS)
 
 
 def env_flag(name):
@@ -322,7 +337,7 @@ def fill_lines(cands, cap, used):
     return chosen, used
 
 
-def trim(text, read_mode=False):
+def trim(text, read_mode=False, min_lines=MAX_LINES):
     """返回裁剪后的文本；如果不需要裁剪则返回 None。
 
     输出结构：开头行 → [省略标记] → 捞回的关键行 → [末尾标记] → 结尾行
@@ -334,6 +349,7 @@ def trim(text, read_mode=False):
     （上限 MAX_FILL_ROUNDS 轮；两实现使用相同循环，保 parity）。
     v0.6.9：标记带行号区间（供模型 offset 定向回查）；read_mode 时按「头 + 尾 + 符号行」
     处理源码，并用符号行措辞。
+    v1.2：min_lines 参数化行数门槛——普通 120、源码 Read 1500、数据类 Read 200。
     """
     lines = text.split("\n")
     total = len(lines)
@@ -344,11 +360,12 @@ def trim(text, read_mode=False):
     if MARK_OMIT in text or MARK_TAIL in text:
         return None
 
-    # 触发条件：普通工具「行数 > 120 或字节 > 预算」；Read 只认长文件（行数 > 1500 且字节超预算）
+    # 触发条件：普通工具「行数 > min_lines 且字节 > 预算」；
+    # Read 模式（源码 / 数据类）「行数 > min_lines 或字节 > 预算」——只认长文件
     if not read_mode:
-        if total <= MAX_LINES and tbytes <= budget_bytes:
+        if total <= min_lines and tbytes <= budget_bytes:
             return None
-    elif total <= READ_MIN_LINES or tbytes <= budget_bytes:
+    elif total <= min_lines or tbytes <= budget_bytes:
         return None
 
     # v1.1：头尾行数按平均行长估，再在下面按预算扩张
@@ -562,16 +579,35 @@ def main():
     try:
         tool = data.get("tool_name")
         resp = data.get("tool_response")
-        read_mode = tool == "Read" and env_flag("WB_OPS_READ_TRIM")
-        if tool == "Read" and not read_mode:
-            trace("Read 未开启按需裁剪（WB_OPS_READ_TRIM!=1），透传")
-            return
+        # v1.2：Read 分两档——
+        #   数据类（.log/.jsonl/.csv…）：普通关键字模式 + 200 行门槛，默认就裁（无开关）；
+        #   源码类：仍要 WB_OPS_READ_TRIM=1，门槛 1500 行，按符号行裁剪。
+        # hooks.json 的 if 规则已把源码文件挡在 hook 之外，所以这里两条路径互不干扰。
+        read_mode = False
+        min_lines = MAX_LINES
+        if tool == "Read":
+            tool_input = data.get("tool_input")
+            path = ""
+            if isinstance(tool_input, dict):
+                for key in ("file_path", "path"):
+                    value = tool_input.get(key)
+                    if isinstance(value, str) and value:
+                        path = value
+                        break
+            if is_data_file(path):
+                min_lines = READ_DATA_MIN_LINES
+            elif env_flag("WB_OPS_READ_TRIM"):
+                read_mode = True
+                min_lines = READ_MIN_LINES
+            else:
+                trace("Read 非数据文件且未开启 WB_OPS_READ_TRIM，透传 | %s" % path[:200])
+                return
         # v1.1（P0-2）：失败一律整段透传。结构化字段优先（is_error / exitCode /
         # tool_error_code / error），再兜文本里的「Exit Code: N」。
         if resp_failed(resp) or text_failed(text):
             trace("工具 %s 失败（结构化或文本信号），保留完整输出，透传" % tool)
             return
-        trimmed = trim(text, read_mode)
+        trimmed = trim(text, read_mode, min_lines)
     except Exception as e:   # 兜底：裁剪出任何意外都静默透传，绝不让 hook 挂住会话
         trace("裁剪异常，透传：%r" % (e,))
         return
