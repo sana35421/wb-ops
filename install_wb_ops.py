@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
@@ -63,7 +64,7 @@ PLUGINS = os.path.join(WB, "plugins")
 MARKETPLACE = "local"   # 市场名；可用 --marketplace NAME 覆盖
 PLUGIN = "wb-ops"
 PLUGIN_ID = "%s@%s" % (PLUGIN, MARKETPLACE)
-VERSION = "1.3.0"
+VERSION = "1.3.3"
 BACKUP_SUFFIX = ".bak-2026-10-15-wbops"
 
 # PostToolUse 两组（v1.2 起）：普通工具一组，Read 数据类文件一组（带 if 条件）
@@ -110,6 +111,7 @@ PUBLISH_WHITELIST = (
     "commands",           # 斜杠命令
     "bin",                # 原生裁剪器
     "report.py",          # /wb-ops:report 与 --serve
+    "CHANGELOG.md",       # v1.3.1：变更史（清单 description 只留一行指引，指向这里）
 )
 
 # 白名单目录内部仍要排除：非插件内容 / 备份 / 日志
@@ -118,6 +120,7 @@ IGNORE_PATTERNS = (
     ".workbuddy", ".git", "__pycache__", "install_wb_ops.py", "*.bak*", "trace.log",
     "*.build.json",  # 构建戳只在仓库侧给 test_hook.py 用，运行期不需要
     "backup",        # backup/ 是开发侧回滚快照
+    "_verify",       # 专项探针属开发侧产物，不进发布副本
     "_*.log",        # 测试日志不随版本分发
 )
 SYNC_IGNORE = shutil.ignore_patterns(*IGNORE_PATTERNS)
@@ -565,6 +568,108 @@ def stale_versions():
     return [v for v in versions if v not in keep]
 
 
+SPILL_KEEP_DAYS = 7              # v1.3.1：spill 落盘副本保留天数
+SPILL_SESSION_CAP = 8 * 1048576  # 单会话目录上限（超出先删最旧）
+SPILL_TOTAL_CAP = 50 * 1048576   # spill 总量上限
+BUDGET_KEEP_DAYS = 2             # 预算旁路文件（ctx-guard 写，TTL 24h）保留天数
+
+
+def _data_root():
+    """与 hooks/trim.py 的 data_dir() 同源：WB_OPS_STATS_DIR 优先，否则 ~/.workbuddy/wb-ops-data。"""
+    base = os.environ.get("WB_OPS_STATS_DIR")
+    if base:
+        return base
+    return os.path.join(os.path.expanduser("~"), ".workbuddy", "wb-ops-data")
+
+
+def _list_files(root):
+    """返回 [(mtime, size, path)]，跳过目录。"""
+    out = []
+    for dp, _dn, fn in os.walk(root):
+        for name in fn:
+            q = os.path.join(dp, name)
+            try:
+                st = os.stat(q)
+            except OSError:
+                continue
+            out.append((st.st_mtime, st.st_size, q))
+    return out
+
+
+def gc_spill(apply=False):
+    """v1.3.1：按「7 天 / 单会话 8MB / 总量 50MB」清理 spill 落盘副本与过期预算旁路。
+
+    三条规则按「先到先清」叠加：先删超龄文件，再压单会话体积，最后压总量。
+    返回 (待删文件数, 可回收字节)。默认只预演。
+    """
+    root = _data_root()
+    spill = os.path.join(root, "spill")
+    victims = set()
+    if os.path.isdir(spill):
+        now = time.time()
+        files = _list_files(spill)
+        # ① 超龄
+        for mt, _sz, q in files:
+            if now - mt > SPILL_KEEP_DAYS * 86400:
+                victims.add(q)
+        # ② 单会话目录超限：从最旧删到阈值以下
+        by_dir = {}
+        for mt, sz, q in files:
+            by_dir.setdefault(os.path.dirname(q), []).append((mt, sz, q))
+        for _d, items in by_dir.items():
+            left = sum(sz for _mt, sz, q in items if q not in victims)
+            if left <= SPILL_SESSION_CAP:
+                continue
+            for mt, sz, q in sorted(items):
+                if left <= SPILL_SESSION_CAP:
+                    break
+                if q in victims:
+                    continue
+                victims.add(q)
+                left -= sz
+        # ③ 总量超限：同样从最旧删起
+        live = [(mt, sz, q) for mt, sz, q in files if q not in victims]
+        total = sum(sz for _mt, sz, _q in live)
+        for _mt, sz, q in sorted(live):
+            if total <= SPILL_TOTAL_CAP:
+                break
+            victims.add(q)
+            total -= sz
+    # ④ 预算旁路：ctx-guard 的 TTL 是 24h，留 2 天足够
+    budget = os.path.join(root, "budget")
+    if os.path.isdir(budget):
+        now = time.time()
+        for mt, _sz, q in _list_files(budget):
+            if now - mt > BUDGET_KEEP_DAYS * 86400:
+                victims.add(q)
+
+    reclaim = 0
+    for q in victims:
+        try:
+            reclaim += os.path.getsize(q)
+        except OSError:
+            pass
+    if apply:
+        for q in victims:
+            try:
+                os.remove(q)
+            except OSError:
+                pass
+        # 顺手删空目录（会话目录清空后不留骨架）
+        for base in (spill, budget):
+            if not os.path.isdir(base):
+                continue
+            for dp, _dn, _fn in os.walk(base, topdown=False):
+                if dp == base:
+                    continue
+                try:
+                    if not os.listdir(dp):
+                        os.rmdir(dp)
+                except OSError:
+                    pass
+    return len(victims), reclaim
+
+
 def gc(apply=False):
     """清理旧版本安装快照。默认只预演；确认后加 --yes 执行。"""
     root = os.path.join(PLUGINS, "cache", MARKETPLACE, PLUGIN)
@@ -572,6 +677,12 @@ def gc(apply=False):
     print("安装快照目录：%s" % root)
     if not stale:
         print("  无旧版本可清理（保留：当前 %s + 注册表版本 + 最近的 1 个旧版本）。" % VERSION)
+        n_sp, sz_sp = gc_spill(apply)
+        if n_sp:
+            print("  spill/预算旁路：%d 个文件，约 %.1f MB%s"
+                  % (n_sp, sz_sp / 1048576.0, "（已删除）" if apply else "（预演）"))
+        else:
+            print("  spill/预算旁路：无需清理")
         return 0
     total = 0
     for v in stale:
@@ -581,6 +692,10 @@ def gc(apply=False):
         total += size
         print("  %s  %6d KB" % (v.ljust(8), size // 1024))
     print("  合计可回收约 %.1f MB" % (total / 1048576.0))
+    n_sp, sz_sp = gc_spill(False)
+    if n_sp:
+        print("  spill/预算旁路（%d 天规则）：%d 个文件，约 %.1f MB"
+              % (SPILL_KEEP_DAYS, n_sp, sz_sp / 1048576.0))
     if not apply:
         print("  注意：运行中的会话可能仍锁定其中某个版本（删除后该会话的裁剪会静默失效，"
               "输出原样透传）——确认无旧会话在用后再执行。")
@@ -589,6 +704,9 @@ def gc(apply=False):
     for v in stale:
         shutil.rmtree(os.path.join(root, v))
         print("  已删除 %s" % v)
+    n_sp2, sz_sp2 = gc_spill(True)
+    if n_sp2:
+        print("  已清 spill/预算旁路 %d 个文件，回收 %.1f MB" % (n_sp2, sz_sp2 / 1048576.0))
     return 0
 
 

@@ -294,33 +294,129 @@ def trace(msg):
         pass
 
 
-def stats(tool, sid, before, after):
+PROBE_PREFIX = ("test", "bench", "probe", "demo", "sampl")
+SPILL_MAX_FILES = 999        # 单会话目录内的序号上限（超过就不再落盘，避免无限膨胀）
+
+
+def data_dir():
+    """记账 / 旁路 / spill 的公共数据根目录（WB_OPS_STATS_DIR 覆盖）。取不到返回 ""。"""
+    base = os.environ.get("WB_OPS_STATS_DIR")
+    if base:
+        return base
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    if not home:
+        return ""
+    return os.path.join(home, ".workbuddy", "wb-ops-data")
+
+
+def is_probe(sid):
+    """无 session_id 或探针前缀 = 测试/基准产物，不记账也不落盘。"""
+    return (not sid) or sid[:5] in PROBE_PREFIX
+
+
+def is_spill_file(path):
+    """v1.3.2：Read 回查保护——spill 目录下的文件不参与裁剪。
+
+    落盘的意义是「能拿回全文」。若 Read 回查时又被预算裁一次，就只能拿到预算内的
+    那一段，还会再写一份新的 spill（链式放大）。判据按 data_dir()/spill 前缀，
+    兼容 WB_OPS_STATS_DIR 自定义数据根；大小写与分隔符都归一化（Windows 传反斜杠）。
+    """
+    if not path:
+        return False
+    base = data_dir()
+    if not base:
+        return False
+    root = base.replace("\\", "/").lower().rstrip("/") + "/spill/"
+    return path.replace("\\", "/").lower().startswith(root)
+
+
+def spill_write(text, sid, tool):
+    """v1.3.1：把原文全文落盘，返回相对 data_dir 的路径（spill/<sid8>/001-Grep.txt）。
+
+    为什么存全文而不是「被省略的中段」：存全文时标记里的行号区间与文件行号一一对应，
+    模型拿到 hint 就能直接 Read offset/limit，不需要做行号映射（映射错一次就白读）。
+    开关：WB_OPS_SPILL=0 关闭；WB_OPS_STATS=0 一并关闭（测试/基准默认不落盘）。
+    失败返回 ""——调用方据此不给模型指路，避免指向不存在的文件。
+    """
+    try:
+        if os.environ.get("WB_OPS_SPILL") == "0" or os.environ.get("WB_OPS_STATS") == "0":
+            return ""
+        if is_probe(sid or ""):
+            return ""
+        base = data_dir()
+        if not base:
+            return ""
+        sid8 = u8_prefix(sid, 8)
+        folder = os.path.join(base, "spill", sid8)
+        os.makedirs(folder, exist_ok=True)
+        name_tool = tool or "tool"
+        for i in range(1, SPILL_MAX_FILES + 1):
+            name = "%03d-%s.txt" % (i, name_tool)
+            path = os.path.join(folder, name)
+            try:
+                # "x" = 独占创建：并发下撞名直接换下一个序号，绝不覆盖已有落盘
+                with open(path, "x", encoding="utf-8", newline="") as f:
+                    f.write(text)
+            except FileExistsError:
+                continue
+            return "spill/%s/%s" % (sid8, name)
+    except Exception:
+        pass
+    return ""
+
+
+def spill_abs(rel):
+    """相对路径 -> 可交给模型 Read 的绝对路径（统一正斜杠）。"""
+    base = data_dir()
+    if not base or not rel:
+        return ""
+    return os.path.join(base, rel.replace("/", os.sep)).replace("\\", "/")
+
+
+def spill_hint(rel, lines):
+    """标记里追加的取回指引（绝对路径，模型可直接拿去 Read）。rel 为空返回 ""。"""
+    full = spill_abs(rel)
+    if not full:
+        return ""
+    return "；全量 %d 行已落盘 %s，可 Read 该文件取回" % (lines, full)
+
+
+def spill_drop(rel):
+    """预判落盘但最终没裁（trim 返回 None）时撤销，别在磁盘上留无用副本。"""
+    full = spill_abs(rel)
+    if not full:
+        return
+    try:
+        os.remove(full.replace("/", os.sep))
+    except Exception:
+        pass
+
+
+def stats(tool, sid, before, after, spill=""):
     """v0.3.0 节省记账：每次裁剪成功后 append 一行 JSONL（默认开启，失败静默）。
 
     落点：%USERPROFILE%\\.workbuddy\\wb-ops-data\\saves-YYYYMM.jsonl
     （WB_OPS_STATS_DIR 覆盖数据目录；WB_OPS_STATS=0 整关）。
     行格式与 src/trim.cpp 的 stats() 逐字节对齐（时间戳除外）：
-      {"t":毫秒,"s":会话id前8字节,"tool":"Grep","b":原始字节,"a":裁剪后字节}
-    只记尺寸与时间，不落任何输出内容。
+      {"t":毫秒,"s":会话id前8字节,"tool":"Grep","b":原始字节,"a":裁剪后字节,"spill":"相对路径"}
+    v1.3.1：spill 记相对路径（不含盘符/临时目录），exe 与 py 在各自目录下写出的值一致，
+    账本因此仍可逐字节比对；值为 "" 表示本次未落盘。
     """
     try:
         if os.environ.get("WB_OPS_STATS") == "0":
             return
         # v1.1（P2）：只记真实会话。测试/基准探头没有 session_id 或带探针前缀，
         # 混进账本会把报表口径带偏（0.6.9 的账本里就混着 7 条测试产物）。
-        if not sid or sid[:5] in ("test", "bench", "probe", "demo", "sampl"):
+        if is_probe(sid or ""):
             return
-        base = os.environ.get("WB_OPS_STATS_DIR")
+        base = data_dir()
         if not base:
-            home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
-            if not home:
-                return
-            base = os.path.join(home, ".workbuddy", "wb-ops-data")
+            return
         os.makedirs(base, exist_ok=True)
         month = datetime.now().strftime("%Y%m")
         path = os.path.join(base, "saves-%s.jsonl" % month)
         line = json.dumps({"t": int(time.time() * 1000), "s": u8_prefix(sid or "", 8),
-                           "tool": tool, "b": before, "a": after},
+                           "tool": tool, "b": before, "a": after, "spill": spill},
                           ensure_ascii=False, separators=(",", ":"))
         # newline=""：关闭文本模式的行尾翻译，与原生版的二进制写 \n 逐字节对齐（S4）
         with open(path, "a", encoding="utf-8", newline="") as f:
@@ -469,8 +565,26 @@ def gap_hint(shown, total, read_mode):
     return hint
 
 
+def wants_trim(text, read_mode, min_lines, strict_gate, hard_bytes, budget_bytes):
+    """与 trim() 完全同构的门槛预判（只判断「会不会裁」，不算正文）。
+
+    v1.3.1：落盘要在 trim 之前决定（标记里得带路径），而给不需要裁的小输出
+    写文件再删纯属浪费——所以先用同一套门槛过一遍。判错只会多写/少写一个文件，
+    正确性由 trim() 的返回值兜底（返回 None 时调用方删掉刚落盘的副本）。
+    """
+    if MARK_OMIT in text or MARK_TAIL in text:
+        return False
+    total = text.count("\n") + 1
+    tbytes = blen(text)
+    if strict_gate:
+        return not (tbytes < hard_bytes and (total <= min_lines or tbytes <= budget_bytes))
+    if not read_mode:
+        return not (total <= min_lines and tbytes <= budget_bytes)
+    return not (total <= min_lines or tbytes <= budget_bytes)
+
+
 def trim(text, read_mode=False, min_lines=MAX_LINES, strict_gate=False, hard_bytes=0,
-         doc_mode=False, line_ok=False):
+         doc_mode=False, line_ok=False, spill_note=""):
     """返回裁剪后的文本；如果不需要裁剪则返回 None。
 
     输出结构：开头行 → [省略标记] → 捞回的关键行 → [末尾标记] → 结尾行
@@ -484,6 +598,8 @@ def trim(text, read_mode=False, min_lines=MAX_LINES, strict_gate=False, hard_byt
     处理源码，并用符号行措辞。
     v1.2：min_lines 参数化行数门槛——普通 120、源码 Read 1500、数据类 Read 200。
     v1.3.0：doc_mode（.md 文档档）——中段改捞 Markdown 标题行，措辞随之切换。
+    v1.3.1：spill_note——落盘取回指引，拼进首个省略标记；其字节从预算里预先扣除，
+    保证「正文 + 标记」仍不超预算（否则会触发兜底截断，把尾部行切掉）。
     """
     lines = text.split("\n")
     total = len(lines)
@@ -539,6 +655,7 @@ def trim(text, read_mode=False, min_lines=MAX_LINES, strict_gate=False, hard_byt
         if line_mode:
             # v1.3.0：这里没有行号可用，offset/limit 是行导向的，给了反而误导
             marker += "；行数极少但字节很大，按行跳不过去，建议 Grep -n 检索"
+        marker += spill_note
         marker += "] …"
         if looks_json(text):
             marker += "\n… [wb-ops 注：原文为 JSON 结构，截断后已非合法 JSON] …"
@@ -556,7 +673,8 @@ def trim(text, read_mode=False, min_lines=MAX_LINES, strict_gate=False, hard_byt
     is_key = [bool(hit(line)) for line in lines]
     hit_total = sum(is_key)   # 全文命中总数 M（标记文案用）
 
-    budget = budget_bytes - MARKER_RESERVE
+    # v1.3.1：落盘指引也占标记额度，先扣掉再分给正文（否则兜底截断会切掉尾部行）
+    budget = budget_bytes - MARKER_RESERVE - blen(spill_note)
 
     # ---- v1.1：预算扩张。头尾行数按平均行长估出来后，
     # 若填充没用到 FILL_TARGET_PCT 预算，就放大头尾再来一轮（最多 GROW_ROUNDS 轮）；
@@ -640,21 +758,22 @@ def trim(text, read_mode=False, min_lines=MAX_LINES, strict_gate=False, hard_byt
     parts = list(head_shown)
     if key_shown:
         if sampled:
-            parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行），%s的 %d 条中均匀抽取 %d 条如下%s] …"
+            parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行），%s的 %d 条中均匀抽取 %d 条如下%s%s] …"
                          % (silent, rng_lo, rng_hi,
-                            samp_word, pool_n, len(key_shown), hint))
+                            samp_word, pool_n, len(key_shown), hint, spill_note))
         else:
             marker = ("… [wb-ops 省略 %d 行（第 %d–%d 行），以下为捞回的 %d 条%s"
                       % (silent, rng_lo, rng_hi, len(key_shown), key_word))
             if len(key_shown) < hit_total:
                 marker += "（共命中 %d 条）" % hit_total
-            parts.append(marker + (hint if hint else ("，可用 offset 回查" if line_mode else "")) + "] …")
+            parts.append(marker + (hint if hint else ("，可用 offset 回查" if line_mode else ""))
+                         + spill_note + "] …")
     elif hit_total:
-        parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行，%s已包含在显示区域）%s] …"
-                     % (silent, rng_lo, rng_hi, key_word, hint))
+        parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行，%s已包含在显示区域）%s%s] …"
+                     % (silent, rng_lo, rng_hi, key_word, hint, spill_note))
     else:
-        parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行，未发现 %s）%s] …"
-                     % (silent, rng_lo, rng_hi, hit_word, hint))
+        parts.append("… [wb-ops 省略 %d 行（第 %d–%d 行，未发现 %s）%s%s] …"
+                     % (silent, rng_lo, rng_hi, hit_word, hint, spill_note))
     parts.extend(key_shown)
     if looks_json(text):
         # P1-2：行导向裁剪后必然不是合法 JSON，明说一句，省得模型拿去 json.loads 白跑
@@ -762,6 +881,10 @@ def main():
                     if isinstance(value, str) and value:
                         path = value
                         break
+            if is_spill_file(path):
+                # v1.3.2：回查 spill 落盘文件——原样透传，不让预算把它再裁一次
+                trace("Read 落在 spill 目录，透传（回查全文不二次裁剪）| %s" % path[:200])
+                return
             if is_data_file(path):
                 if is_struct_file(path):
                     min_lines = READ_STRUCT_MIN_LINES
@@ -786,14 +909,23 @@ def main():
         if resp_failed(resp) or text_failed(text):
             trace("工具 %s 失败（结构化或文本信号），保留完整输出，透传" % tool)
             return
+        # v1.3.1：先落盘再裁——标记里要写路径，而路径长度得先扣预算。
+        # 只对「确实会裁」的输出落盘：小结果占调用的大多数，不给它们写文件再删。
+        _sid = data.get("session_id")
+        _sid = _sid if isinstance(_sid, str) else ""
+        spill_rel = ""
+        if wants_trim(text, read_mode, min_lines, strict_gate, hard_bytes, resolve_budget()):
+            spill_rel = spill_write(text, _sid, tool)
+        note = spill_hint(spill_rel, text.count("\n") + 1)
         trimmed = trim(text, read_mode, min_lines, strict_gate, hard_bytes, doc_mode,
-                       tool == "Read")
+                       tool == "Read", note)
     except Exception as e:   # 兜底：裁剪出任何意外都静默透传，绝不让 hook 挂住会话
         trace("裁剪异常，透传：%r" % (e,))
         return
     if trimmed is None:
         trace("工具 %s 输出不长（或无省空间收益，%d 字符 / %d 行），不裁"
               % (data.get("tool_name"), len(text), text.count("\n") + 1))
+        spill_drop(spill_rel)   # 预判裁、实际没裁：撤掉落盘副本
         return  # 不长，不动
 
     trace("工具 %s 已裁剪：%d -> %d 字节"
@@ -802,7 +934,7 @@ def main():
     # v0.3.0 节省记账（默认开启；任何异常静默，绝不影响裁剪输出）
     sid = data.get("session_id")
     stats(data.get("tool_name"), sid if isinstance(sid, str) else "",
-          blen(text), blen(trimmed))
+          blen(text), blen(trimmed), spill_rel)
 
     payload = {
         "hookSpecificOutput": {

@@ -412,16 +412,16 @@ def case_service_identity():
         args.port = 12345
         with patch("http.server.ThreadingHTTPServer.__init__", side_effect=OSError(errno.EADDRINUSE, "碰撞")), \
                 patch.object(report, "_probe_service", side_effect=[
-                    (None, "启动中", True), (identity, "", False)]) as probe, \
+                    (None, "启动中", True, False), (identity, "", False, False)]) as probe, \
                 patch.object(report.time, "sleep"):
             result = report.serve(args)
         check("仅启动碰撞时短重试并复用", result == 0 and probe.call_count == 2)
         with patch("http.server.ThreadingHTTPServer.__init__", side_effect=OSError(errno.EADDRINUSE, "碰撞")), \
-                patch.object(report, "_probe_service", return_value=(None, "版本不匹配", False)) as probe:
+                patch.object(report, "_probe_service", return_value=(None, "版本不匹配", False, False)) as probe:
             result = report.serve(args)
         check("明确身份不匹配不重试", result != 0 and probe.call_count == 1)
         with patch("http.server.ThreadingHTTPServer.__init__", side_effect=OSError(errno.EADDRINUSE, "碰撞")), \
-                patch.object(report, "_probe_service", return_value=(None, "无响应", True)) as probe, \
+                patch.object(report, "_probe_service", return_value=(None, "无响应", True, False)) as probe, \
                 patch.object(report.time, "monotonic", side_effect=[0.0, 1.0, 2.1]), \
                 patch.object(report.time, "sleep"):
             result = report.serve(args)

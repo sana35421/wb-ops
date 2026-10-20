@@ -1366,7 +1366,7 @@ def serve(args):
             # 同时启动时，先绑定者可能尚未来得及进入请求循环。
             deadline = time.monotonic() + 2.0
             while True:
-                health, reason, retry = _probe_service(args.port, identity)
+                health, reason, retry, _refused = _probe_service(args.port, identity)
                 if health is not None:
                     print("复用已有实时报告服务：http://127.0.0.1:%d/" % args.port, flush=True)
                     return 0
@@ -1429,8 +1429,35 @@ def _service_identity(config):
             "config_fingerprint": hashlib.sha256(encoded).hexdigest()}
 
 
+def _port_free(port):
+    """端口是否真的空着（没人监听）。用 bind 判，不用 connect。
+
+    2026-10-20 实测：本机对 127.0.0.1 的关闭端口是**超时**（TimeoutError）而不是
+    ECONNREFUSED —— 防火墙静默丢包。所以「按异常类型区分空端口/挂死服务」在这台机器上
+    永远判成后者，只能靠 bind：绑得上 = 没人监听，绑不上 = 被占用（可能是挂死的服务）。
+    """
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # 不设 SO_REUSEADDR：Windows 下有人监听时 bind 会直接报 10048
+        s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def _probe_service(port, expected):
-    """有限读取本机健康 JSON；禁用系统代理及重定向，绝不按 Server 响应头认身份。"""
+    """有限读取本机健康 JSON；禁用系统代理及重定向，绝不按 Server 响应头认身份。
+
+    返回 (health, reason, retry, refused)：refused 单独标出「端口根本没人在监听」，
+    因为它和「有人占着但不应答」是两件完全不同的事 —— 前者该提示 `--serve` 启动，
+    后者才是「旧服务版本/配置不对、需要重启」。2026-10-20 之前两者都落到同一句话，
+    `--status --port <空端口>` 会误报「占用者未及时响应……请重启旧服务」。
+    """
+    import errno
     import http.client
     import urllib.error
     import urllib.request
@@ -1444,26 +1471,34 @@ def _probe_service(port, expected):
     try:
         with opener.open(url, timeout=0.4) as response:
             if response.status != 200:
-                return None, "健康端点未返回 200", False
+                return None, "健康端点未返回 200", False, False
             body = response.read(4097)
         if len(body) > 4096:
-            return None, "健康响应超过大小限制", False
+            return None, "健康响应超过大小限制", False, False
         health = json.loads(body.decode("utf-8"))
     except urllib.error.HTTPError as e:
         e.close()
-        return None, "占用者没有兼容的健康端点", False
-    except (urllib.error.URLError, OSError):
-        return None, "占用者未及时响应健康检查", True
+        return None, "占用者没有兼容的健康端点", False, False
+    except (urllib.error.URLError, OSError) as e:
+        # Windows 上是 URLError(ConnectionRefusedError(10061))；errno/winerror 双查
+        cause = getattr(e, "reason", e)
+        refused = (isinstance(cause, ConnectionRefusedError) or isinstance(e, ConnectionRefusedError)
+                   or getattr(cause, "errno", None) in (errno.ECONNREFUSED, 10061)
+                   or getattr(cause, "winerror", None) == 10061)
+        if refused or _port_free(port):
+            # retry 仍为 True：`--serve` 撞 EADDRINUSE 时，先绑定者可能尚未进入请求循环
+            return None, "端口 %d 没有服务在监听" % port, True, True
+        return None, "占用者未及时响应健康检查", True, False
     except (http.client.HTTPException, ValueError, UnicodeError, RecursionError):
-        return None, "占用者未返回有效的健康 JSON", False
+        return None, "占用者未返回有效的健康 JSON", False, False
     if not isinstance(health, dict) or any(health.get(key) != expected[key]
                                          for key in ("service", "protocol")):
-        return None, "占用者不是兼容协议的 wb-ops 服务", False
+        return None, "占用者不是兼容协议的 wb-ops 服务", False, False
     if health.get("version") != expected["version"]:
-        return None, "版本不匹配（需要 wb-ops %s）" % expected["version"], False
+        return None, "版本不匹配（需要 wb-ops %s）" % expected["version"], False, False
     if health.get("config_fingerprint") != expected["config_fingerprint"]:
-        return None, "配置不匹配（数据源或刷新/裁剪配置不同）", False
-    return health, "", False
+        return None, "配置不匹配（数据源或刷新/裁剪配置不同）", False, False
+    return health, "", False, False
 
 
 def main():
@@ -1492,9 +1527,13 @@ def main():
     if args.serve:
         return serve(args)
     if args.status:
-        health, reason, _retry = _probe_service(args.port, _service_identity(_service_config(args)))
+        health, reason, _retry, refused = _probe_service(args.port, _service_identity(_service_config(args)))
         if health is None:
-            print("服务探测失败：%s。请以当前版本和配置重启旧服务。" % reason, file=sys.stderr)
+            if refused:
+                print("没有服务在监听：http://127.0.0.1:%d/（需要时执行 --serve 启动）" % args.port,
+                      file=sys.stderr)
+            else:
+                print("服务探测失败：%s。请以当前版本和配置重启旧服务。" % reason, file=sys.stderr)
             return 1
         print("服务身份匹配，已监听：http://127.0.0.1:%d/（%s）" % (
             args.port, "数据已就绪" if health.get("ready") is True else "首次数据加载中"))

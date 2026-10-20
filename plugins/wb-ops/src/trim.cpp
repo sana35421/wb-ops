@@ -23,6 +23,7 @@
 //   g++ -O2 -s -static -static-libgcc -static-libstdc++ -o bin/wb-ops-trim.exe src/trim.cpp
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -51,6 +52,7 @@ static const int MAX_KEY_LINES = 40;   // 中间区域最多捞回多少条关�
 static const int MIN_LINE_BYTES = 60;  // 截断展示时单行至少保留的字节数，低于此值整行丢弃
 static const int MAX_LINE_BYTES = 1000;// 单行最多展示的字节数（防 minified 超长行吃掉预算）
 static const int MARKER_RESERVE = 420; // 给省略标记预留的字节数（v1.3.0：含最长连续段 offset 提示）
+static const int SPILL_MAX_FILES = 999; // v1.3.1：单会话 spill 目录的序号上限
 
 // ---- v0.3.5：预算可配置（WB_OPS_BUDGET，单位字节）----
 static const int BUDGET_MIN = 2000;    // 允许的最小预算（再窄内容只剩骨架）
@@ -433,24 +435,118 @@ static void ensure_dirs(const std::string &path) {
     }
 }
 
+// 记账 / 旁路 / spill 的公共数据根目录（WB_OPS_STATS_DIR 覆盖）。取不到返回空串。
+static std::string data_base() {
+    const char *dir = getenv("WB_OPS_STATS_DIR");
+    std::string base = (dir && *dir) ? dir : "";
+    if (!base.empty()) return base;
+    const char *home = getenv("USERPROFILE");
+    if (!home || !*home) return "";
+    return std::string(home) + "\\.workbuddy\\wb-ops-data";
+}
+
+// 无 session_id 或探针前缀 = 测试/基准产物，不记账也不落盘
+static bool is_probe(const std::string &sid) {
+    if (sid.empty()) return true;
+    static const char *FAKE_PREFIX[] = {"test", "bench", "probe", "demo", "sampl"};
+    for (size_t k = 0; k < 5; k++) {
+        if (sid.compare(0, 5, FAKE_PREFIX[k]) == 0) return true;
+    }
+    return false;
+}
+
+// v1.3.1：把原文全文落盘，返回相对 data_base 的路径（spill/<sid8>/001-Grep.txt）。
+// 存全文的理由与 py 侧一致：行号与标记里的区间一一对应，模型可直接 Read offset/limit。
+// 开关：WB_OPS_SPILL=0 关闭；WB_OPS_STATS=0 一并关闭（测试/基准默认不落盘）。
+static std::string spill_write(const std::string &text, const std::string &sid,
+                               const std::string &tool) {
+    const char *off = getenv("WB_OPS_SPILL");
+    if (off && strcmp(off, "0") == 0) return "";
+    const char *st = getenv("WB_OPS_STATS");
+    if (st && strcmp(st, "0") == 0) return "";
+    if (is_probe(sid)) return "";
+    try {
+        std::string base = data_base();
+        if (base.empty()) return "";
+        std::string sid8 = u8_prefix(sid, 8);
+        std::string dir = base + "\\spill\\" + sid8;
+        ensure_dirs(dir);
+        std::string name_tool = tool.empty() ? std::string("tool") : tool;
+        for (int i = 1; i <= SPILL_MAX_FILES; i++) {
+            char nb[96];
+            snprintf(nb, sizeof(nb), "%03d-%s.txt", i, name_tool.c_str());
+            std::string fp = dir + "\\" + nb;
+            // v1.3.2：原子独占创建（O_EXCL）。旧写法先 fopen(rb) 探测再 fopen(wb) 写，
+            // 两个并发调用可能同时判定「不存在」→ 后写的截断先写的。模型一轮里发多个
+            // 并行 Grep 时就会踩到，后果比丢文件更糟：标记指向的落盘内容变成另一条结果。
+            int fd = _open(fp.c_str(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY,
+                           _S_IREAD | _S_IWRITE);
+            if (fd < 0) {
+                if (errno == EEXIST) continue;   // 撞名：换下一个序号，绝不覆盖
+                return "";                       // 目录不可写等：放弃落盘，裁剪照旧
+            }
+            int wrote = (int)_write(fd, text.data(), (unsigned)text.size());
+            _close(fd);
+            if (wrote != (int)text.size()) {     // 写一半失败：别留残文件误导回查
+                remove(fp.c_str());
+                return "";
+            }
+            return "spill/" + sid8 + "/" + nb;
+        }
+    } catch (...) {
+    }
+    return "";
+}
+
+// v1.3.2：Read 回查保护——spill 目录下的文件不参与裁剪。
+// 落盘的意义是「能拿回全文」；若 Read 回查时又被预算裁一次，只能拿到预算内的那一段，
+// 还会再写一份新的 spill（链式放大）。判据按 data_base()/spill 前缀，兼容 WB_OPS_STATS_DIR。
+static bool is_spill_file(const std::string &path) {
+    if (path.empty()) return false;
+    std::string base = data_base();
+    if (base.empty()) return false;
+    std::string root = base;
+    while (!root.empty() && (root[root.size() - 1] == '\\' || root[root.size() - 1] == '/'))
+        root.erase(root.size() - 1);
+    root += "\\spill\\";
+    std::string a = path;
+    std::string b = root;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i] == '\\') a[i] = '/';
+        if (a[i] >= 'A' && a[i] <= 'Z') a[i] = (char)(a[i] - 'A' + 'a');
+    }
+    for (size_t i = 0; i < b.size(); i++) {
+        if (b[i] == '\\') b[i] = '/';
+        if (b[i] >= 'A' && b[i] <= 'Z') b[i] = (char)(b[i] - 'A' + 'a');
+    }
+    return a.size() >= b.size() && a.compare(0, b.size(), b) == 0;
+}
+
+// 相对路径 -> 可交给模型 Read 的绝对路径（统一正斜杠）
+static std::string spill_abs(const std::string &rel) {
+    if (rel.empty()) return "";
+    std::string base = data_base();
+    if (base.empty()) return "";
+    std::string full = base + "\\" + rel;
+    for (size_t i = 0; i < full.size(); i++) if (full[i] == '\\') full[i] = '/';
+    return full;
+}
+
+static void spill_drop(const std::string &rel) {
+    std::string full = spill_abs(rel);
+    if (full.empty()) return;
+    remove(full.c_str());
+}
+
 static void stats(const std::string &tool, const std::string &sid,
-                  long long before, long long after) {
+                  long long before, long long after, const std::string &spill) {
     const char *off = getenv("WB_OPS_STATS");
     if (off && strcmp(off, "0") == 0) return;  // 显式关闭
     // v1.1（P2）：只记真实会话，测试/基准探头（无 session_id 或带探针前缀）不入账本
-    if (sid.empty()) return;
-    static const char *FAKE_PREFIX[] = {"test", "bench", "probe", "demo", "sampl"};
-    for (size_t k = 0; k < 5; k++) {
-        if (sid.compare(0, 5, FAKE_PREFIX[k]) == 0) return;
-    }
+    if (is_probe(sid)) return;
     try {
-        const char *dir = getenv("WB_OPS_STATS_DIR");
-        std::string base = (dir && *dir) ? dir : "";
-        if (base.empty()) {
-            const char *home = getenv("USERPROFILE");
-            if (!home || !*home) return;
-            base = std::string(home) + "\\.workbuddy\\wb-ops-data";
-        }
+        std::string base = data_base();
+        if (base.empty()) return;
         ensure_dirs(base);
 
         long long now_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -469,7 +565,9 @@ static void stats(const std::string &tool, const std::string &sid,
         line += ",\"tool\":";
         dump_str(tool, line);                   // JSON 转义（S4）
         line += ",\"b\":" + std::to_string(before) +
-                ",\"a\":" + std::to_string(after) + "}\n";
+                ",\"a\":" + std::to_string(after) + ",\"spill\":";
+        dump_str(spill, line);   // v1.3.1：相对路径，双实现逐字节一致
+        line += "}\n";
         fwrite(line.data(), 1, line.size(), f);
         fclose(f);
     } catch (...) {
@@ -982,9 +1080,26 @@ static std::string gap_hint(const std::vector<char> &shown, size_t total, bool r
     return hint;
 }
 
+// v1.3.1：与 trim_text 同构的门槛预判（只判断「会不会裁」，不算正文）。
+// 落盘要在裁剪之前决定（标记里得带路径），小输出占多数，不能给它们写文件再删。
+static bool wants_trim(const std::string &text, bool read_mode, int min_lines,
+                       bool strict_gate, size_t hard_bytes, long long budget_bytes) {
+    if (text.find(MARK_OMIT) != std::string::npos ||
+        text.find(MARK_TAIL) != std::string::npos) return false;
+    size_t total = 1;
+    for (size_t i = 0; i < text.size(); i++) if (text[i] == '\n') total++;
+    long long tbytes = (long long)text.size();
+    if (strict_gate)
+        return !(tbytes < (long long)hard_bytes &&
+                 ((long long)total <= min_lines || tbytes <= budget_bytes));
+    if (!read_mode)
+        return !((long long)total <= min_lines && tbytes <= budget_bytes);
+    return !((long long)total <= min_lines || tbytes <= budget_bytes);
+}
+
 static bool trim_text(const std::string &text, bool read_mode, int min_lines,
                       bool strict_gate, size_t hard_bytes, bool doc_mode, bool line_ok,
-                      std::string &out) {
+                      const std::string &spill_note, std::string &out) {
     std::vector<std::string> lines;
     {
         size_t st = 0;
@@ -1062,6 +1177,7 @@ static bool trim_text(const std::string &text, bool read_mode, int min_lines,
             // v1.3.0：这里没有行号可用，offset/limit 是行导向的，给了反而误导
             marker += "；行数极少但字节很大，按行跳不过去，建议 Grep -n 检索";
         }
+        marker += spill_note;
         marker += "] …";
         if (looks_json(text)) {
             marker += "\n… [wb-ops 注：原文为 JSON 结构，截断后已非合法 JSON] …";
@@ -1085,7 +1201,8 @@ static bool trim_text(const std::string &text, bool read_mode, int min_lines,
         }
     }
 
-    const size_t budget = budget_bytes - (size_t)MARKER_RESERVE;
+    // v1.3.1：落盘指引也占标记额度，先扣掉再分给正文（否则兜底截断会切掉尾部行）
+    const size_t budget = budget_bytes - (size_t)MARKER_RESERVE - spill_note.size();
 
     // ---- v1.1：预算扩张。头尾行数按平均行长估出来后，
     // 若填充没用到 FILL_TARGET_PCT 预算，就放大头尾再来一轮（最多 GROW_ROUNDS 轮）；
@@ -1134,14 +1251,16 @@ static bool trim_text(const std::string &text, bool read_mode, int min_lines,
                           : (read_mode ? "函数/类/import 行" : "error/warning 关键字");
 
     std::vector<std::string> parts(head_shown);
-    char mbuf[512];
+    char mbuf[768];
+    // v1.3.1：取回指引接在回查建议之后（与 py 侧同位置、同措辞）
+    const std::string hint2 = hint + spill_note;
     if (!key_shown.empty()) {
         if (sampled) {
             snprintf(mbuf, sizeof(mbuf),
                      "… [wb-ops 省略 %lld 行（第 %lld–%lld 行），%s的 %d 条中均匀抽取 %d 条如下%s] …",
                      silent, rng_lo, rng_hi,
                      doc_mode ? "命中标题行" : (read_mode ? "命中符号" : "命中关键字"),
-                     (int)pool_n, (int)key_shown.size(), hint.c_str());
+                     (int)pool_n, (int)key_shown.size(), hint2.c_str());
             parts.push_back(mbuf);
         } else {
             snprintf(mbuf, sizeof(mbuf),
@@ -1153,18 +1272,19 @@ static bool trim_text(const std::string &text, bool read_mode, int min_lines,
                 marker += mbuf;
             }
             marker += hint.empty() ? (line_mode ? "，可用 offset 回查" : "") : hint;
+            marker += spill_note;
             marker += "] …";
             parts.push_back(marker);
         }
     } else if (hit_total) {
         snprintf(mbuf, sizeof(mbuf),
                  "… [wb-ops 省略 %lld 行（第 %lld–%lld 行，%s已包含在显示区域）%s] …",
-                 silent, rng_lo, rng_hi, key_word, hint.c_str());
+                 silent, rng_lo, rng_hi, key_word, hint2.c_str());
         parts.push_back(mbuf);
     } else {
         snprintf(mbuf, sizeof(mbuf),
                  "… [wb-ops 省略 %lld 行（第 %lld–%lld 行，未发现 %s）%s] …",
-                 silent, rng_lo, rng_hi, hit_word, hint.c_str());
+                 silent, rng_lo, rng_hi, hit_word, hint2.c_str());
         parts.push_back(mbuf);
     }
     parts.insert(parts.end(), key_shown.begin(), key_shown.end());
@@ -1390,6 +1510,11 @@ int main(int argc, char **argv) {
                 if (v && v->t == JVal::STR && !v->s.empty()) path = v->s;
             }
         }
+        if (is_spill_file(path)) {
+            // v1.3.2：回查 spill 落盘文件——原样透传，不让预算把它再裁一次
+            trace("Read 落在 spill 目录，透传（回查全文不二次裁剪）| " + path.substr(0, 200));
+            return 0;
+        }
         if (is_data_file(path)) {
             // 结构类 .json 门槛更高（读它多半是为了接着改），且要两项都过线才裁
             if (is_struct_file(path)) {
@@ -1417,10 +1542,25 @@ int main(int argc, char **argv) {
         trace(std::string("工具 ") + tool + " 失败（结构化或文本信号），保留完整输出，透传");
         return 0;
     }
+    // v1.3.1：先落盘再裁（标记里要写路径，路径长度得先进预算）；只给「确实会裁」的输出落盘
+    const JVal *sidv = root.get("session_id");
+    const std::string sid = (sidv && sidv->t == JVal::STR) ? sidv->s : std::string("");
+    std::string spill_rel;
+    if (wants_trim(text, read_mode, min_lines, strict_gate, hard_bytes,
+                   (long long)resolve_budget()))
+        spill_rel = spill_write(text, sid, tool);
+    std::string spill_note;
+    if (!spill_rel.empty()) {
+        size_t nlines = 1;
+        for (size_t i = 0; i < text.size(); i++) if (text[i] == '\n') nlines++;
+        spill_note = "；全量 " + to_str((long long)nlines) + " 行已落盘 " + spill_abs(spill_rel) +
+                     "，可 Read 该文件取回";
+    }
     if (!trim_text(text, read_mode, min_lines, strict_gate, hard_bytes, doc_mode,
-                   tool == "Read", trimmed)) {
+                   tool == "Read", spill_note, trimmed)) {
         trace(std::string("\xe5\xb7\xa5\xe5\x85\xb7 ") + tool +
               " \xe8\xbe\x93\xe5\x87\xba\xe4\xb8\x8d\xe9\x95\xbf\xef\xbc\x8c\xe4\xb8\x8d\xe8\xa3\x81");
+        spill_drop(spill_rel);   // 预判裁、实际没裁：撤掉落盘副本
         return 0;
     }
 
@@ -1428,11 +1568,7 @@ int main(int argc, char **argv) {
           " -> " + to_str((long long)trimmed.size()) + " 字节");
 
     // v0.3.0 节省记账（默认开启；失败静默，绝不影响裁剪输出）
-    {
-        const JVal *sidv = root.get("session_id");
-        stats(tool, (sidv && sidv->t == JVal::STR) ? sidv->s : std::string(""),
-              (long long)text.size(), (long long)trimmed.size());
-    }
+    stats(tool, sid, (long long)text.size(), (long long)trimmed.size(), spill_rel);
 
     std::string out = "{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"updatedToolOutput\":";
     dump_str(trimmed, out);

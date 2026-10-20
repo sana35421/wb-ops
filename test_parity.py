@@ -257,15 +257,19 @@ def build_cases():
         rows.append('  "end": 0')
         rows.append("}")
         return "\n".join(rows)
+
     # 41. .json 700 行 / ~15KB：字节超预算但行数未过 800 → 透传
     cases.append(("Read .json 700 行（透传）", "Read", json_dump(700),
                   {}, {"file_path": "D:/tmp/package-lock.json"}))
+
     # 42. .json 850 行 / ~19KB：两项都过线 → 裁剪
     cases.append(("Read .json 850 行（裁剪）", "Read", json_dump(850),
                   {}, {"file_path": "D:/tmp/package-lock.json"}))
+
     # 43. 对照：日志类仍是 200 行且只看单项，600 行 .log（~28KB）照裁
     cases.append(("Read .log 600 行（裁剪）", "Read", "\n".join(log_lines[:600]),
                   {}, {"file_path": "D:/tmp/service.log"}))
+
     # 44. 硬阀：行数很少但体量巨大的 dump（30 行 / ~60KB）仍要裁
     big_rows = ["{"] + ['  "blob": "%s",' % ("x" * 2000) for _ in range(28)] + ["}"]
     cases.append(("Read .json 30 行超大（硬阀裁剪）", "Read", "\n".join(big_rows),
@@ -382,8 +386,8 @@ def test_stats_parity():
     d_py = tempfile.mkdtemp(prefix="wbops-stats-py-")
     r_ex = subprocess.run([EXE], input=payload, capture_output=True,
                           env=dict(os.environ, WB_OPS_STATS_DIR=d_ex))
-    subprocess.run([PYTHON, PY_SCRIPT], input=payload, capture_output=True,
-                   env=dict(os.environ, WB_OPS_STATS_DIR=d_py))
+    r_py = subprocess.run([PYTHON, PY_SCRIPT], input=payload, capture_output=True,
+                          env=dict(os.environ, WB_OPS_STATS_DIR=d_py))
     l_ex, l_py = read_lines(d_ex), read_lines(d_py)
 
     checks = []
@@ -392,10 +396,30 @@ def test_stats_parity():
         o_ex, o_py = json.loads(l_ex[0]), json.loads(l_py[0])
         t_ex, t_py = o_ex.pop("t"), o_py.pop("t")
         checks.append(("除 t 外逐字段一致", o_ex == o_py))
-        checks.append(("字段恰为 s/tool/b/a", set(o_ex) == {"s", "tool", "b", "a"}))
+        checks.append(("字段恰为 s/tool/b/a/spill",
+                       set(o_ex) == {"s", "tool", "b", "a", "spill"}))
         checks.append(("sid 取前 8 位", o_ex["s"] == "abcdef12"))
         checks.append(("tool 正确", o_ex["tool"] == "Grep"))
         src = "\n".join(raw_lines).encode("utf-8")
+        # v1.3.1：spill 落盘——账本记相对路径，双实现必须同值且指向真实文件
+        sp = o_ex.get("spill", "")
+        checks.append(("spill 相对路径形状", sp == "spill/abcdef12/001-Grep.txt"))
+        fsp = os.path.join(d_ex, sp.replace("/", os.sep)) if sp else ""
+        checks.append(("exe 落盘内容 = 原文逐字节",
+                       bool(fsp) and os.path.exists(fsp) and open(fsp, "rb").read() == src))
+        sp_py = o_py.get("spill", "")
+        fsp_py = os.path.join(d_py, sp_py.replace("/", os.sep)) if sp_py else ""
+        checks.append(("py 落盘内容 = 原文逐字节",
+                       bool(fsp_py) and os.path.exists(fsp_py) and open(fsp_py, "rb").read() == src))
+        # 开落盘时两侧输出只应差「绝对路径的根」（各在自己的临时目录里）
+        o_ex_s = normalize(r_ex.stdout) or ""
+        o_py_s = normalize(r_py.stdout) or ""
+        o_ex_n = o_ex_s.replace(d_ex.replace("\\", "/"), "<BASE>")
+        o_py_n = o_py_s.replace(d_py.replace("\\", "/"), "<BASE>")
+        checks.append(("开落盘时双实现输出仅差路径根",
+                       bool(o_ex_n) and o_ex_n == o_py_n))
+        checks.append(("落盘指引指向会话目录",
+                       "全量 %d 行已落盘" % len(raw_lines) in o_ex_n))
         trimmed = normalize(r_ex.stdout)
         checks.append(("b=原始字节", o_ex["b"] == len(src)))
         checks.append(("a=裁剪后字节",
@@ -439,6 +463,27 @@ def test_stats_parity():
     subprocess.run([EXE], input=payload, capture_output=True,
                    env=dict(os.environ, WB_OPS_STATS="0", WB_OPS_STATS_DIR=d_off))
     checks.append(("WB_OPS_STATS=0 不写", read_lines(d_off) == []))
+    checks.append(("WB_OPS_STATS=0 也不落盘", not os.path.exists(os.path.join(d_off, "spill"))))
+
+    # v1.3.1：WB_OPS_SPILL=0 关落盘，但账本照记（spill 字段为空串）
+    d_sp0 = tempfile.mkdtemp(prefix="wbops-spill-off-")
+    d_sp0_py = tempfile.mkdtemp(prefix="wbops-spill-off-py-")
+    subprocess.run([EXE], input=payload, capture_output=True,
+                   env=dict(os.environ, WB_OPS_STATS_DIR=d_sp0, WB_OPS_SPILL="0"))
+    subprocess.run([PYTHON, PY_SCRIPT], input=payload, capture_output=True,
+                   env=dict(os.environ, WB_OPS_STATS_DIR=d_sp0_py, WB_OPS_SPILL="0"))
+    l_sp0 = read_lines(d_sp0)
+    l_sp0_py = read_lines(d_sp0_py)
+    checks.append(("WB_OPS_SPILL=0：账本 spill 为空串",
+                   len(l_sp0) == 1 and json.loads(l_sp0[0]).get("spill") == ""))
+    checks.append(("WB_OPS_SPILL=0：不建 spill 目录",
+                   not os.path.exists(os.path.join(d_sp0, "spill"))))
+    same = False
+    if l_sp0 and l_sp0_py:
+        a = {k: v for k, v in json.loads(l_sp0[0]).items() if k != "t"}
+        b = {k: v for k, v in json.loads(l_sp0_py[0]).items() if k != "t"}
+        same = a == b
+    checks.append(("WB_OPS_SPILL=0：双实现一致", same))
 
     # 边界：无 session_id -> v1.1 起不入账（无法归属会话，视为探头）
     p2 = json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Grep",
@@ -474,6 +519,56 @@ def test_stats_parity():
             fails += 1
     for d in (d_ex, d_py, d_ex2, d_py2, d_off, d_no, d_short, d_pre):
         shutil.rmtree(d, ignore_errors=True)
+    return fails
+
+
+def test_spill_readback():
+    """v1.3.2：spill 回查保护——Read 落在 spill 目录下的文件原样透传。
+
+    落盘的意义是「能拿回全文」；若回查时又被预算裁一次，只能拿到预算内的那一段，
+    还会再写一份新 spill（链式放大）。对照组放在 spill 目录外，证明同内容仍会被裁。
+    """
+    print()
+    print("=" * 72)
+    print("v1.3.2 spill 回查保护")
+    print("=" * 72)
+    checks = []
+    body = "\n".join("2026-10-20 12:00:00 ERROR request failed id=%d payload=%s"
+                     % (i, "x" * 40) for i in range(400))
+    d = tempfile.mkdtemp(prefix="wbops-readback-")
+    sdir = os.path.join(d, "spill", "abcdef12")
+    os.makedirs(sdir, exist_ok=True)
+    spill_fp = os.path.join(sdir, "001-Grep.txt")
+    plain_fp = os.path.join(d, "plain.txt")
+    for fp in (spill_fp, plain_fp):
+        with open(fp, "w", encoding="utf-8", newline="") as f:
+            f.write(body)
+    env = dict(ENV_NO_STATS, WB_OPS_STATS_DIR=d)
+
+    def out_of(cmd, fp):
+        return normalize(run(cmd, make_payload("Read", body,
+                                               tool_input={"file_path": fp}), env=env))
+
+    for name, cmd in (("exe", [EXE]), ("py", [PYTHON, PY_SCRIPT])):
+        v_plain = out_of(cmd, plain_fp)
+        checks.append(("%s：spill 目录外同内容仍被裁" % name,
+                       isinstance(v_plain, str) and len(v_plain) < len(body)))
+        v_sp = out_of(cmd, spill_fp)
+        checks.append(("%s：spill 内原样透传（反斜杠）" % name,
+                       v_sp is None or v_sp == body))
+        v_sp2 = out_of(cmd, spill_fp.replace("\\", "/"))
+        checks.append(("%s：spill 内原样透传（正斜杠）" % name,
+                       v_sp2 is None or v_sp2 == body))
+    checks.append(("双实现判定一致（裁剪与透传）",
+                   out_of([EXE], plain_fp) == out_of([PYTHON, PY_SCRIPT], plain_fp)
+                   and out_of([EXE], spill_fp) == out_of([PYTHON, PY_SCRIPT], spill_fp)))
+
+    fails = 0
+    for name, ok in checks:
+        print("  %s  %s" % ("OK  " if ok else "FAIL", name))
+        if not ok:
+            fails += 1
+    shutil.rmtree(d, ignore_errors=True)
     return fails
 
 
@@ -676,6 +771,7 @@ def main():
             if name == "关键字超 40 均匀抽样" and not ("err-0050" in n_ex and "err-2950" in n_ex):
                 assert_fail += 1
                 print("        !! 关键字超限抽样未覆盖全局")
+
             # ---- v1.3.0：文档档捞回特征 ----
             if name == "Read .md 1200 行（标题行捞回）" and not (
                     "以下为捞回的" in n_ex and "条标题行" in n_ex and "## section" in n_ex):
@@ -749,6 +845,7 @@ def main():
     stats_fail = test_stats_parity()
 
     # ---- v0.3.5 预算专项 ----
+    readback_fail = test_spill_readback()
     budget_fail = test_budget_env()
 
     # ---- v0.6.1 输入链专项 ----
@@ -781,7 +878,8 @@ def main():
     print("  原生版  （裸 exe 直调）     : %7.1f ms" % t_ex)
     print("  提速                        : %7.1f 倍" % (t_py / t_ex if t_ex else 0))
 
-    # 模拟 hook 真实调用（经 bash 包装）
+    # 模拟 hook 真实调用（经 bash 包装）。bash 与 python 一律环境探测，不写死本机路径：
+    # Windows 上 Git Bash 未必在 PATH，兜底试几个常见安装位置；找不到就跳过这一段（不影响一致性结论）。
     bash = os.environ.get("WB_OPS_TEST_BASH") or shutil.which("bash") or ""
     if not bash:
         for cand in ("C:/Program Files/Git/bin/bash.exe",
@@ -791,7 +889,7 @@ def main():
                 bash = cand
                 break
     if os.path.exists(bash):
-        root_msys = to_msys(PLUGIN)  # 永远指向当前所在的这份代码，不再硬编码旧路径
+        root_msys = to_msys(PLUGIN)  # 插件本体所在处（公开仓布局：plugins/wb-ops），不硬编码旧路径
         cmd_new = '"%s/bin/wb-ops-trim.exe" 2>/dev/null || exit 0' % root_msys
         env = {"CODEBUDDY_PLUGIN_ROOT": root_msys, "PATH": "/usr/bin:/bin",
                "TMP": "/tmp", "WB_OPS_STATS": "0"}
@@ -823,7 +921,7 @@ def main():
 
     print()
     return 0 if (failed == 0 and assert_fail == 0 and stats_fail == 0 and
-                 budget_fail == 0 and io_fail == 0) else 1
+                 readback_fail == 0 and budget_fail == 0 and io_fail == 0) else 1
 
 
 if __name__ == "__main__":
